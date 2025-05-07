@@ -24,22 +24,23 @@ This project is currently not finished, you might encounter bugs and end up with
 ### Using the Install Script (Recommended)
 
 1. Download the zramroot files and enter the directory
+   
    ```bash
    git clone https://github.com/Neol00/zramroot.git
    ```
    ```bash
    cd zramroot
    ```
-2. Make the install script executable:
+3. Make the install script executable:
    ```bash
    chmod +x install.sh
    ```
-3. Run the script with sudo:
+4. Run the script with sudo:
    ```bash
    sudo ./install.sh
    ```
-4. Follow the prompts to complete installation
-5. Reboot and select the zramroot entry in your GRUB menu
+5. Follow the prompts to complete installation
+6. Reboot and select the zramroot entry in your GRUB menu
 
 The install script will:
 - Check for required files
