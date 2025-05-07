@@ -1,0 +1,617 @@
+# Local filesystem mounting			-*- shell-script -*-
+# shellcheck shell=sh
+
+# --- Enhanced Logging Functions ---
+# Variables for physical root logging
+REAL_ROOT_MNT="/mnt/real_root_rw"
+REAL_ROOT_LOG_FILE="${REAL_ROOT_MNT}/var/log/zramroot.log"
+
+# Logs to the physical root log file if available
+zram_log() {
+    local MSG="$@"
+    
+    # Always log to kernel
+    echo "zramroot: $MSG" > /dev/kmsg 2>/dev/null || true
+    
+    # Log to console if not quiet
+    if [ "${quiet}" != "y" ]; then
+        echo "zramroot: $MSG" > /dev/console 2>/dev/null || true
+    fi
+    
+    # Log to physical root if mounted and log file exists
+    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+        now=""
+        if command -v date >/dev/null 2>&1; then
+            now="$(date '+%Y-%m-%d %H:%M:%S')"
+        fi
+        echo "${now} LOCAL-SCRIPT: $MSG" >> "${REAL_ROOT_LOG_FILE}"
+    fi
+}
+
+# Logs system state to physical root log
+log_system_state() {
+    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+        # Separator for readability
+        echo "-------- LOCAL SCRIPT STATE SNAPSHOT --------" >> "${REAL_ROOT_LOG_FILE}"
+        
+        # Log mounted filesystems
+        echo "--- Mounted filesystems:" >> "${REAL_ROOT_LOG_FILE}"
+        mount >> "${REAL_ROOT_LOG_FILE}" 2>&1
+        
+        # Log system parameters
+        echo "--- System Parameters:" >> "${REAL_ROOT_LOG_FILE}"
+        echo "ROOT=${ROOT}" >> "${REAL_ROOT_LOG_FILE}"
+        echo "FSTYPE=${FSTYPE}" >> "${REAL_ROOT_LOG_FILE}"
+        echo "ROOTFLAGS=${ROOTFLAGS}" >> "${REAL_ROOT_LOG_FILE}"
+        echo "ZRAMROOT_DEVICE=${ZRAMROOT_DEVICE}" >> "${REAL_ROOT_LOG_FILE}"
+        echo "ZRAMROOT_FSTYPE=${ZRAMROOT_FSTYPE}" >> "${REAL_ROOT_LOG_FILE}" 
+        echo "ZRAMROOT_ROOTFLAGS=${ZRAMROOT_ROOTFLAGS}" >> "${REAL_ROOT_LOG_FILE}"
+        
+        # Log block devices
+        echo "--- Block devices:" >> "${REAL_ROOT_LOG_FILE}"
+        ls -la /dev/[hsv]d* /dev/mmcblk* /dev/nvme* /dev/zram* 2>/dev/null >> "${REAL_ROOT_LOG_FILE}"
+        
+        # End separator
+        echo "-------------------------------------------" >> "${REAL_ROOT_LOG_FILE}"
+    fi
+}
+
+# Function to finalize log with timestamp and CPU info
+finalize_log() {
+    local status="$1"
+    
+    if [ ! -w "${REAL_ROOT_LOG_FILE}" ]; then
+        return
+    fi
+    
+    local cpu_clock="Unknown"
+    if [ -f /proc/cpuinfo ]; then
+        cpu_clock=$(grep -m1 "MHz" /proc/cpuinfo | awk '{print $4}' || echo "Unknown")
+    fi
+    local date_str=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "Unknown")
+    
+    if [ "${status}" = "success" ]; then
+        echo "=== ZRAMROOT MOUNT COMPLETED SUCCESSFULLY ON ${date_str} | CPU CLOCK: ${cpu_clock} MHz ===" >> "${REAL_ROOT_LOG_FILE}"
+    else
+        echo "=== ZRAMROOT MOUNT FAILED ON ${date_str} | CPU CLOCK: ${cpu_clock} MHz ===" >> "${REAL_ROOT_LOG_FILE}"
+    fi
+    
+    # Ensure log is written to disk
+    sync
+}
+
+local_top()
+{
+	if [ "${local_top_used}" != "yes" ]; then
+		[ "${quiet?}" != "y" ] && log_begin_msg "Running /scripts/local-top"
+		run_scripts /scripts/local-top
+		[ "$quiet" != "y" ] && log_end_msg
+	fi
+	local_top_used=yes
+}
+
+local_block()
+{
+	[ "${quiet?}" != "y" ] && log_begin_msg "Running /scripts/local-block"
+	run_scripts /scripts/local-block "$@"
+	[ "$quiet" != "y" ] && log_end_msg
+}
+
+local_premount()
+{
+	if [ "${local_premount_used}" != "yes" ]; then
+		[ "${quiet?}" != "y" ] && log_begin_msg "Running /scripts/local-premount"
+		run_scripts /scripts/local-premount
+		[ "$quiet" != "y" ] && log_end_msg
+	fi
+	local_premount_used=yes
+}
+
+local_bottom()
+{
+	if [ "${local_premount_used}" = "yes" ] || [ "${local_top_used}" = "yes" ]; then
+		[ "${quiet?}" != "y" ] && log_begin_msg "Running /scripts/local-bottom"
+		run_scripts /scripts/local-bottom
+		[ "$quiet" != "y" ] && log_end_msg
+	fi
+	local_premount_used=no
+	local_top_used=no
+}
+
+# $1=device ID to mount
+# $2=optionname (for root and etc)
+# $3=panic if device is missing (true or false, default: true)
+# Sets $DEV to the resolved device node
+local_device_setup()
+{
+	local dev_id="$1"
+	local name="$2"
+	local may_panic="${3:-true}"
+	local real_dev
+	local time_elapsed
+	local count
+
+	# If wait-for-root understands this prefix, then use it to wait for
+	# the device rather than settling the whole of udev.
+
+	# Timeout is max(30, rootdelay) seconds (approximately)
+	local slumber=30
+	case $DPKG_ARCH in
+		powerpc|ppc64|ppc64el)
+			slumber=180
+			;;
+		*)
+			slumber=30
+			;;
+	esac
+	if [ "${ROOTDELAY:-0}" -gt $slumber ]; then
+		slumber=$ROOTDELAY
+	fi
+
+	case "$dev_id" in
+	UUID=*|LABEL=*|PARTUUID=*|/dev/*)
+		FSTYPE=$( wait-for-root "$dev_id" "$slumber" )
+		;;
+	*)
+		wait_for_udev 10
+		;;
+	esac
+
+	# Load ubi with the correct MTD partition and return since fstype
+	# doesn't work with a char device like ubi.
+	if [ -n "$UBIMTD" ]; then
+		/sbin/modprobe ubi "mtd=$UBIMTD"
+		DEV="${dev_id}"
+		return
+	fi
+
+	# Don't wait for a device that doesn't have a corresponding
+	# device in /dev and isn't resolvable by blkid (e.g. mtd0)
+	if [ "${dev_id#/dev}" = "${dev_id}" ] &&
+	   [ "${dev_id#*=}" = "${dev_id}" ]; then
+		DEV="${dev_id}"
+		return
+	fi
+
+	# If the root device hasn't shown up yet, give it a little while
+	# to allow for asynchronous device discovery (e.g. USB).  We
+	# also need to keep invoking the local-block scripts in case
+	# there are devices stacked on top of those.
+	#
+	# in Ubuntu, we should never actually enter this loop as wait-for-root
+	# above should have waited until the device appeared.
+	if ! real_dev=$(resolve_device "${dev_id}") ||
+	   ! get_fstype "${real_dev}" >/dev/null; then
+		log_begin_msg "Waiting for ${name}"
+
+		while true; do
+			sleep 1
+			time_elapsed="$(time_elapsed)"
+
+			local_block "${dev_id}"
+
+			# If mdadm's local-block script counts the
+			# number of times it is run, make sure to
+			# run it the expected number of times.
+			mdadm_exec=0
+			while true; do
+				if [ -f /run/count.mdadm.initrd ]; then
+					count="$(cat /run/count.mdadm.initrd)"
+				elif [ -n "${count}" ]; then
+					# mdadm script deleted it; put it back
+					count=$((count + 1))
+					echo "${count}" >/run/count.mdadm.initrd
+				else
+					break
+				fi
+				if [ "${count}" -ge "${time_elapsed}" ]; then
+					break;
+				fi
+
+				# Track that mdadm was executed to force
+				# cryptroot execution after the loop, see
+				# LP #1879980.
+				mdadm_exec=1
+				/scripts/local-block/mdadm "${dev_id}"
+
+				# Cryptroot must run here, see LP #1879980.
+				# The counter is inc/dec on cryptroot script!
+				if [ -f /run/cryptroot.initrd.cnt ]; then
+					crypt_cnt=$(cat /run/cryptroot.initrd.cnt)
+					if [ "${crypt_cnt}" -gt 0 ]; then
+						/scripts/local-block/cryptroot "${dev_id}"
+					fi
+				fi
+			done
+
+			# Extra cryptroot run after mdadm loop in order to
+			# start encrypted volumes on top of RAID arrays.
+			if [ -f /run/cryptroot.initrd.cnt ]; then
+				crypt_cnt=$(cat /run/cryptroot.initrd.cnt)
+				if [ "${crypt_cnt}" -gt 0 ] || [ ${mdadm_exec} -ne 0 ]; then
+					/scripts/local-block/cryptroot "${dev_id}"
+				fi
+			fi
+
+			if real_dev=$(resolve_device "${dev_id}") &&
+			   get_fstype "${real_dev}" >/dev/null; then
+				wait_for_udev 10
+				log_end_msg 0
+				break
+			fi
+			if [ "${time_elapsed}" -ge "${slumber}" ]; then
+				log_end_msg 1 || true
+				break
+			fi
+		done
+	fi
+
+	# We've given up, but we'll let the user fix matters if they can
+	while ! real_dev=$(resolve_device "${dev_id}") ||
+	      ! get_fstype "${real_dev}" >/dev/null; do
+		if ! $may_panic; then
+			echo "Gave up waiting for ${name}"
+			return 1
+		fi
+		echo "Gave up waiting for ${name} device.  Common problems:"
+		echo " - Boot args (cat /proc/cmdline)"
+		echo "   - Check rootdelay= (did the system wait long enough?)"
+		if [ "${name}" = root ]; then
+			echo "   - Check root= (did the system wait for the right device?)"
+		fi
+		echo " - Missing modules (cat /proc/modules; ls /dev)"
+		panic "ALERT!  ${dev_id} does not exist.  Dropping to a shell!"
+	done
+
+	DEV="${real_dev}"
+}
+
+local_mount_root()
+{
+    # Check if zramroot parameter exists
+    if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
+        # --- ZRAM Root Path ---
+        log_begin_msg "Detected zramroot parameter, attempting ZRAM mount"
+        echo "zramroot: ZRAM root mount process starting" > /dev/kmsg
+        
+        # Create a unique date-time string for logging
+        DATE_TIME=$(date '+%m-%d-%H%M' 2>/dev/null || echo "unknown")
+        
+        # Log to physical root if mounted
+        if [ -d "/mnt/real_root_rw" ] && mountpoint -q "/mnt/real_root_rw"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [local_script] ZRAM mount starting" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [local_script] Cmdline: $(cat /proc/cmdline)" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+        fi
+
+        # Ensure the premount scripts have run
+        if [ "${local_premount_used}" != "yes" ]; then
+            echo "zramroot: Running local_premount scripts first" > /dev/kmsg
+            local_premount
+        else
+            echo "zramroot: local_premount already executed" > /dev/kmsg
+        fi
+
+        # Try to source variables from the file (better than environment vars)
+        # Try multiple possible locations
+        if [ -f "/conf/zramroot_vars" ]; then
+            echo "zramroot: Sourcing variables from /conf/zramroot_vars" > /dev/kmsg
+            . /conf/zramroot_vars
+            
+            if [ -d "/mnt/real_root_rw" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [local_script] Sourced variables from /conf/zramroot_vars" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            fi
+        elif [ -f "/tmp/zramroot_vars" ]; then
+            echo "zramroot: Sourcing variables from /tmp/zramroot_vars" > /dev/kmsg
+            . /tmp/zramroot_vars
+            
+            if [ -d "/mnt/real_root_rw" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [local_script] Sourced variables from /tmp/zramroot_vars" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            fi
+        fi
+
+        # Check for zramroot-boot script variables
+        if [ -z "${ZRAMROOT_DEVICE}" ] || [ -z "${ZRAMROOT_FSTYPE}" ] || [ -z "${ZRAMROOT_ROOTFLAGS}" ]; then
+            echo "zramroot ERROR: Required ZRAM variables not available, using auto-detection" > /dev/kmsg
+            
+            # Log detailed error
+            if [ -d "/mnt/real_root_rw" ] && mountpoint -q "/mnt/real_root_rw"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') ZRAM variables not found, using auto-detection" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+                
+                # Auto-detect zram device
+                if [ -b "/dev/zram0" ]; then
+                    echo "Found /dev/zram0, using it as root device" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+                    ZRAMROOT_DEVICE="/dev/zram0"
+                    ZRAMROOT_FSTYPE="ext4"
+                    ZRAMROOT_ROOTFLAGS="rw,noatime"
+                else
+                    echo "ERROR: Could not find ZRAM device" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+                    panic "ZRAMROOT Error: No ZRAM device found!"
+                fi
+            fi
+        fi
+
+        echo "zramroot: Using ZRAM device: ${ZRAMROOT_DEVICE}" > /dev/kmsg
+        echo "zramroot: Using ZRAM FSTYPE: ${ZRAMROOT_FSTYPE}" > /dev/kmsg
+        echo "zramroot: Using ZRAM ROOTFLAGS: ${ZRAMROOT_ROOTFLAGS}" > /dev/kmsg
+
+        # Set variables for mounting ZRAM root
+        ROOT="${ZRAMROOT_DEVICE}"
+        FSTYPE="${ZRAMROOT_FSTYPE}"
+        ROOTFLAGS="${ZRAMROOT_ROOTFLAGS}"
+        roflag="-w"  # ZRAM should always be mounted read-write
+
+        # Run local_top scripts
+        echo "zramroot: Running local_top scripts" > /dev/kmsg
+        local_top
+
+        # Skip filesystem check for ZRAM device
+        echo "zramroot: Skipping filesystem check for ZRAM device ${ROOT}" > /dev/kmsg
+
+        # Check if ZRAM is already mounted somewhere
+        ZRAM_MOUNTPOINT=$(grep -w "${ROOT}" /proc/mounts | awk '{print $2}')
+        echo "zramroot: Will mount to rootmnt=${rootmnt}" > /dev/kmsg
+        if [ -d "/mnt/real_root_rw" ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') Will mount to rootmnt=${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            
+            if [ -n "${ZRAM_MOUNTPOINT}" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') WARNING: ZRAM already mounted at ${ZRAM_MOUNTPOINT}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            fi
+        fi
+        
+        # Make sure rootmnt exists
+        mkdir -p "${rootmnt}"
+        
+        # If ZRAM is already mounted somewhere, try to move the mount
+        if [ -n "${ZRAM_MOUNTPOINT}" ]; then
+            echo "zramroot: ZRAM already mounted at ${ZRAM_MOUNTPOINT}, attempting mount move" > /dev/kmsg
+            
+            if [ "${ZRAM_MOUNTPOINT}" = "${rootmnt}" ]; then
+                echo "zramroot: ZRAM already mounted at target location ${rootmnt}, continuing" > /dev/kmsg
+                if [ -d "/mnt/real_root_rw" ]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') ZRAM already mounted at target location ${rootmnt}, continuing" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+                fi
+            else
+                # Try to move the mount
+                echo "zramroot: Moving mount from ${ZRAM_MOUNTPOINT} to ${rootmnt}" > /dev/kmsg
+                if [ -d "/mnt/real_root_rw" ]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') Moving mount from ${ZRAM_MOUNTPOINT} to ${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+                fi
+                
+                # Create a temporary directory if we're moving from /root
+                if [ "${ZRAM_MOUNTPOINT}" = "/root" ] && [ "${rootmnt}" != "/root" ]; then
+                    # We need to move this mount without disrupting the currently running scripts
+                    # First, bind mount it to a temporary location
+                    mkdir -p /tmp/zram_temp
+                    if mount --bind "${ZRAM_MOUNTPOINT}" /tmp/zram_temp; then
+                        # Then unmount the original
+                        umount "${ZRAM_MOUNTPOINT}"
+                        # Now mount the temporary location to the target
+                        if mount --move /tmp/zram_temp "${rootmnt}"; then
+                            echo "zramroot: Successfully moved mount to ${rootmnt}" > /dev/kmsg
+                        else
+                            echo "zramroot ERROR: Failed to move mount from /tmp/zram_temp to ${rootmnt}" > /dev/kmsg
+                            # Try to recover
+                            mount --move /tmp/zram_temp "${ZRAM_MOUNTPOINT}"
+                        fi
+                    else
+                        echo "zramroot ERROR: Failed to bind mount ${ZRAM_MOUNTPOINT}" > /dev/kmsg
+                    fi
+                else
+                    # Direct move for non-/root mounts
+                    if ! mount --move "${ZRAM_MOUNTPOINT}" "${rootmnt}"; then
+                        echo "zramroot ERROR: Failed to move mount from ${ZRAM_MOUNTPOINT} to ${rootmnt}" > /dev/kmsg
+                        if [ -d "/mnt/real_root_rw" ]; then
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: Failed to move mount from ${ZRAM_MOUNTPOINT} to ${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+                        fi
+                    else
+                        echo "zramroot: Successfully moved mount to ${rootmnt}" > /dev/kmsg
+                    fi
+                fi
+            fi
+        else
+            # Mount ZRAM root directly to rootmnt
+            echo "zramroot: Mounting ZRAM root ${ROOT} on ${rootmnt}" > /dev/kmsg
+            
+            # Log detailed information about the mount attempt
+            if [ -d "/mnt/real_root_rw" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') Attempting mount command: mount ${roflag} -t ${FSTYPE} -o ${ROOTFLAGS} ${ROOT} ${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            fi
+            
+            # Try mounting with different option formats
+            if ! mount ${roflag} -t "${FSTYPE}" -o "${ROOTFLAGS}" "${ROOT}" "${rootmnt}"; then
+                echo "zramroot WARNING: First mount attempt failed, trying fallback 1..." > /dev/kmsg
+                
+                if ! mount ${roflag} -t "${FSTYPE}" -o "rw,noatime" "${ROOT}" "${rootmnt}"; then
+                    echo "zramroot WARNING: Second mount attempt failed, trying fallback 2..." > /dev/kmsg
+                    
+                    if ! mount ${roflag} -t "${FSTYPE}" "${ROOT}" "${rootmnt}"; then
+                        echo "zramroot ERROR: All mount attempts failed" > /dev/kmsg
+                        
+                        # Log detailed error
+                        if [ -d "/mnt/real_root_rw" ]; then
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: All mount attempts failed" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+                            echo "ZRAM device status:" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+                            zramctl >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log" 2>&1
+                            
+                            # Check if any mount points are active
+                            echo "Mount points:" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+                            mount >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log" 2>&1
+                        fi
+                        
+                        panic "Failed to mount ZRAM root ${ROOT}!"
+                    else
+                        echo "zramroot: Third mount attempt succeeded" > /dev/kmsg
+                    fi
+                else
+                    echo "zramroot: Second mount attempt succeeded" > /dev/kmsg
+                fi
+            else
+                echo "zramroot: First mount attempt succeeded" > /dev/kmsg
+            fi
+        fi
+        
+        # Verify mount worked
+        if ! mountpoint -q "${rootmnt}"; then
+            echo "zramroot ERROR: Mount verification failed, ${rootmnt} is not a mountpoint" > /dev/kmsg
+            if [ -d "/mnt/real_root_rw" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: Mount verification failed, ${rootmnt} is not a mountpoint" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            fi
+            panic "ZRAM root mount verification failed!"
+        fi
+        
+        # Mount was successful!
+        echo "zramroot: ZRAM root mounted successfully!" > /dev/kmsg
+        
+        # Create directories needed in the ZRAM root
+        for dir in dev proc sys run tmp; do
+            if [ ! -d "${rootmnt}/${dir}" ]; then
+                echo "zramroot: Creating required directory: ${rootmnt}/${dir}" > /dev/kmsg
+                mkdir -p "${rootmnt}/${dir}"
+                chmod 755 "${rootmnt}/${dir}"
+            fi
+        done
+        
+        # Add final log entry
+        if [ -d "/mnt/real_root_rw" ] && mountpoint -q "/mnt/real_root_rw"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') ZRAM root mounted successfully as root filesystem!" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            echo "Mounted device: ${ROOT}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            echo "Mount point: ${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            finalize_log "success"
+        fi
+        
+        log_end_msg 0
+
+    else
+        # Standard root mounting logic (as in original script)
+        log_begin_msg "No zramroot parameter detected, proceeding with standard mount"
+
+		if [ -z "${ROOT}" ]; then
+			panic "No root device specified. Boot arguments must include a root= parameter."
+		fi
+
+		# Setup the physical root device (wait, resolve UUIDs, etc.)
+		local_device_setup "${ROOT}" "root file system"
+		ROOT="${DEV}" # Update ROOT with the resolved device path
+
+		# Get the root filesystem type if not set
+		if [ -z "${ROOTFSTYPE}" ] || [ "${ROOTFSTYPE}" = auto ]; then
+			FSTYPE=$(get_fstype "${ROOT}")
+		else
+			FSTYPE=${ROOTFSTYPE}
+		fi
+
+		# Run premount scripts (e.g., cryptsetup, LVM)
+		local_premount
+
+		# Set read-only/read-write flag
+		if [ "${readonly?}" = "y" ] && [ -z "$LOOP" ]; then
+			roflag=-r
+		else
+			roflag=-w
+		fi
+
+		# Check the filesystem if necessary
+		checkfs "${ROOT}" root "${FSTYPE}"
+
+		# Mount standard root
+		# shellcheck disable=SC2086 # We want word splitting for ROOTFLAGS
+		mount ${roflag} ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" "${rootmnt?}"
+		mountroot_status="$?"
+
+		# Handle LOOP device mounting if specified (usually for ISO booting)
+		if [ "$LOOP" ]; then
+			if [ "$mountroot_status" != 0 ]; then
+				# Original error handling for loop mount failure
+				if [ "${FSTYPE}" = ntfs ] || [ "${FSTYPE}" = vfat ]; then
+					panic "Could not mount the partition ${ROOT} for loop setup. (filesystem = ${FSTYPE}, error code = $mountroot_status)"
+				else
+				    panic "Failed to mount ${ROOT} for loop setup (error code = $mountroot_status)"
+				fi
+			fi
+
+			mkdir -p /host
+			mount -o move "$rootmnt" /host
+
+			while [ ! -e "/host/${LOOP#/}" ]; do
+				panic "ALERT! Loop file /host/${LOOP#/} does not exist. Dropping to a shell!"
+			done
+
+			# Get the loop filesystem type if not set
+			# shellcheck disable=SC2153
+			LOOP_FSTYPE="$LOOPFSTYPE"
+			if [ -z "$LOOP_FSTYPE" ] || [ "$LOOP_FSTYPE" = "unknown" ]; then
+				LOOP_FSTYPE=$(/sbin/blkid -s TYPE -o value "/host/${LOOP#/}")
+				[ -z "$LOOP_FSTYPE" ] && LOOP_FSTYPE="unknown"
+			fi
+
+			if [ "$readonly" = y ]; then
+				loop_roflag=-r
+			else
+				loop_roflag=-w
+			fi
+
+			modprobe loop || panic "Failed to load loop module"
+
+			# shellcheck disable=SC2086 # We want word splitting for LOOPFLAGS
+			if ! mount ${loop_roflag} -o loop -t ${LOOP_FSTYPE} ${LOOPFLAGS} "/host/${LOOP#/}" "${rootmnt?}"; then
+			    panic "Failed to mount loop device ${LOOP} (Type: ${LOOP_FSTYPE})"
+			fi
+
+			if [ -d "$rootmnt/host" ]; then
+				mount -o move /host "$rootmnt/host"
+			fi
+		elif [ "$mountroot_status" != 0 ]; then
+		    # Handle mount failure for non-loop devices
+			panic "Failed to mount standard root device ${ROOT} (Type: ${FSTYPE}, error code = $mountroot_status)"
+		fi
+		log_end_msg 0
+	fi
+}
+
+local_mount_fs()
+{
+	read_fstab_entry "$1"
+
+	local_device_setup "$MNT_FSNAME" "$1 file system"
+	MNT_FSNAME="${DEV}"
+
+	local_premount
+
+	if [ "${readonly}" = "y" ]; then
+		roflag=-r
+	else
+		roflag=-w
+	fi
+
+	if [ "$MNT_PASS" != 0 ]; then
+		checkfs "$MNT_FSNAME" "$MNT_DIR" "${MNT_TYPE}"
+	fi
+
+	# Mount filesystem
+	if ! mount ${roflag} -t "${MNT_TYPE}" -o "${MNT_OPTS}" "$MNT_FSNAME" "${rootmnt}${MNT_DIR}"; then
+		panic "Failed to mount ${MNT_FSNAME} as $MNT_DIR file system."
+	fi
+}
+
+mountroot()
+{
+	local_mount_root
+}
+
+mount_top()
+{
+	# Note, also called directly in case it's overridden.
+	local_top
+}
+
+mount_premount()
+{
+	# Note, also called directly in case it's overridden.
+	local_premount
+}
+
+mount_bottom()
+{
+	# Note, also called directly in case it's overridden.
+	local_bottom
+}
