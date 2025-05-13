@@ -43,4 +43,4 @@ ZRAM_DEVICE_NUM=0
 TRIGGER_PARAMETER="zramroot"
 
 # Seconds to wait for the real root device to appear
-WAIT_TIMEOUT=3
+WAIT_TIMEOUT=5
