@@ -17,7 +17,7 @@ TRIGGER_PARAMETER="zramroot" # Default trigger word
 WAIT_TIMEOUT=20 # Seconds to wait for the real root device
 ZRAM_DEVICE_NUM=0
 ZRAM_SIZE_MiB=0
-ZRAM_ALGO="zstd"
+ZRAM_ALGO="lz4"
 ZRAM_FS_TYPE="ext4"
 ZRAM_MOUNT_OPTS="rw,noatime"
 RAM_MIN_FREE_MiB=512   # Minimum RAM to leave free after ZRAM allocation
@@ -28,7 +28,7 @@ ESTIMATED_COMPRESSION_RATIO=2.5
 ZRAM_BUFFER_PERCENT=10
 BOOT_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "unknown")
 
-# Use a temporary mount point in /tmp instead of /root
+# Use a temporary mount point in /tmp
 ZRAM_TEMP_MNT="/tmp/zram_temp"
 
 # --- Early ARM64 Debug ---
@@ -261,6 +261,85 @@ mount_physical_root() {
     early_debug "Physical root mounted successfully for logging at ${REAL_ROOT_MNT}"
     early_debug "Log file initialized at ${REAL_ROOT_LOG_FILE}"
     return 0
+}
+
+# Function to properly unmount the physical root after ZRAM setup
+cleanup_physical_mounts() {
+    log_msg "Cleaning up physical mount at ${REAL_ROOT_MNT}..."
+    
+    if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
+        # Sync any pending writes to the log file
+        sync
+        
+        # Close any open file handles to the mount (just in case)
+        fuser -km "${REAL_ROOT_MNT}" 2>/dev/null || true
+        sleep 1
+        
+        # Unmount the physical root
+        if ! umount "${REAL_ROOT_MNT}"; then
+            log_msg "Warning: Regular unmount failed, trying force unmount..."
+            if ! umount -f "${REAL_ROOT_MNT}"; then
+                log_msg "Warning: Force unmount failed, trying lazy unmount..."
+                umount -l "${REAL_ROOT_MNT}" || true
+            fi
+        fi
+        
+        # Verify unmount
+        if mountpoint -q "${REAL_ROOT_MNT}"; then
+            log_error "Failed to unmount physical root at ${REAL_ROOT_MNT}"
+            return 1
+        else
+            log_msg "Successfully unmounted physical root"
+        fi
+    fi
+    
+    # Remove the mount point directory
+    rmdir "${REAL_ROOT_MNT}" 2>/dev/null || true
+    
+    return 0
+}
+
+final_mount_cleanup() {
+    log_msg "Performing final mount cleanup before handing off to local script..."
+    
+    # List all current mounts for debugging
+    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+        echo "--- Mounts before final cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
+        mount >> "${REAL_ROOT_LOG_FILE}" 2>&1
+        echo "--- End mounts before cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
+    fi
+    
+    # Specifically target common problematic mounts
+    local problematic_mounts="/boot/efi /boot/EFI /efi /EFI /boot"
+    
+    for mount_point in $problematic_mounts; do
+        if mountpoint -q "$mount_point" 2>/dev/null; then
+            log_msg "Final cleanup: unmounting $mount_point"
+            
+            # Aggressive cleanup approach
+            sync
+            fuser -km "$mount_point" 2>/dev/null || true
+            sleep 1
+            
+            # Try different unmount strategies
+            if umount "$mount_point" 2>/dev/null; then
+                log_debug "Successfully unmounted $mount_point"
+            elif umount -f "$mount_point" 2>/dev/null; then
+                log_debug "Force unmounted $mount_point"  
+            elif umount -l "$mount_point" 2>/dev/null; then
+                log_debug "Lazy unmounted $mount_point"
+            else
+                log_debug "Warning: Could not unmount $mount_point in final cleanup"
+            fi
+        fi
+    done
+    
+    # Final mount listing for debugging
+    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+        echo "--- Mounts after final cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
+        mount >> "${REAL_ROOT_LOG_FILE}" 2>&1
+        echo "--- End mounts after cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
+    fi
 }
 
 # --- Configuration Loading Function ---
@@ -820,6 +899,24 @@ if [ $exit_code -ne 0 ]; then
     
     panic "ZRAMROOT: Preparation script failed. See ${REAL_ROOT_LOG_FILE} for details."
 fi
+
+# After ZRAM is prepared and variables are exported, unmount the physical root
+log_msg "Preparing to unmount physical root drive..."
+
+# First, finalize the log with success
+finalize_log 0
+
+# Give file system a moment to flush the log
+sync
+sleep 1
+
+# Now unmount the physical root
+if ! cleanup_physical_mounts; then
+    log_error "Warning: Could not properly unmount physical root"
+    # Don't fail here - ZRAM is ready, just warn about the lingering mount
+fi
+
+final_mount_cleanup
 
 early_debug "zramroot-boot script completed successfully with code ${exit_code}"
 exit $exit_code

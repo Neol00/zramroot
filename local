@@ -397,7 +397,7 @@ local_mount_root()
                         echo "zramroot ERROR: Failed to bind mount ${ZRAM_MOUNTPOINT}" > /dev/kmsg
                     fi
                 else
-                    # Direct move for non-/root mounts
+                    # Direct move for non-/ mounts
                     if ! mount --move "${ZRAM_MOUNTPOINT}" "${rootmnt}"; then
                         echo "zramroot ERROR: Failed to move mount from ${ZRAM_MOUNTPOINT} to ${rootmnt}" > /dev/kmsg
                         if [ -d "/mnt/real_root_rw" ]; then
@@ -479,6 +479,13 @@ local_mount_root()
             finalize_log "success"
         fi
         
+        # Mount was successful!
+        echo "zramroot: ZRAM root mounted successfully!" > /dev/kmsg
+        
+        # CREATE THIS SECTION - Add cleanup of other mounts
+        log_msg "Cleaning up non-essential mounts..."
+        cleanup_other_mounts
+        force_cleanup_efi_mount
         log_end_msg 0
 
     else
@@ -591,6 +598,138 @@ local_mount_fs()
 	if ! mount ${roflag} -t "${MNT_TYPE}" -o "${MNT_OPTS}" "$MNT_FSNAME" "${rootmnt}${MNT_DIR}"; then
 		panic "Failed to mount ${MNT_FSNAME} as $MNT_DIR file system."
 	fi
+}
+
+cleanup_other_mounts() {
+    log_msg "Aggressively cleaning up all non-essential mounted filesystems..."
+    
+    # List of mount points that should definitely be unmounted
+    local boot_mounts_to_cleanup=""
+    local other_mounts_to_cleanup=""
+    
+    # First pass: identify all mounts we need to clean up
+    while IFS=' ' read -r device mount_point fs_type opts freq pass; do
+        # Skip special filesystems that should remain mounted
+        case "$mount_point" in
+            # These are essential and should stay mounted
+            /proc | /sys | /dev | /run | /tmp | "${rootmnt}")
+                continue
+                ;;
+            # These are boot-related and should be unmounted
+            /boot/* | /boot | /efi)
+                log_debug "Found boot mount to cleanup: $device on $mount_point"
+                boot_mounts_to_cleanup="$boot_mounts_to_cleanup $mount_point"
+                ;;
+            *)
+                # Check if this is a physical device mount
+                case "$device" in
+                    /dev/[hsv]d* | /dev/mmcblk* | /dev/nvme* | UUID=* | LABEL=* | PARTUUID=*)
+                        # Don't unmount our logging mount if it's still there
+                        if [ "$mount_point" != "/mnt/real_root_rw" ]; then
+                            log_debug "Found physical mount to cleanup: $device on $mount_point"
+                            other_mounts_to_cleanup="$other_mounts_to_cleanup $mount_point"
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
+    done < /proc/mounts
+    
+    # Function to safely unmount a filesystem
+    safe_unmount() {
+        local mount_point="$1"
+        local description="$2"
+        
+        if ! mountpoint -q "$mount_point"; then
+            log_debug "$description $mount_point is not mounted, skipping"
+            return 0
+        fi
+        
+        log_msg "Unmounting $description: $mount_point"
+        
+        # Kill processes using this mount
+        if command -v fuser >/dev/null; then
+            fuser -km "$mount_point" 2>/dev/null || true
+            sleep 1
+        fi
+        
+        # Try multiple unmount strategies
+        if umount "$mount_point" 2>/dev/null; then
+            log_debug "Successfully unmounted $mount_point"
+            return 0
+        elif umount -f "$mount_point" 2>/dev/null; then
+            log_debug "Force unmounted $mount_point"
+            return 0
+        elif umount -l "$mount_point" 2>/dev/null; then
+            log_debug "Lazy unmounted $mount_point"
+            return 0
+        else
+            log_error "Failed to unmount $mount_point"
+            return 1
+        fi
+    }
+    
+    # Unmount boot-related mounts first (they often depend on other mounts)
+    for mount_point in $boot_mounts_to_cleanup; do
+        safe_unmount "$mount_point" "boot mount"
+    done
+    
+    # Then unmount other physical device mounts
+    for mount_point in $other_mounts_to_cleanup; do
+        safe_unmount "$mount_point" "physical mount"
+    done
+    
+    # Special handling for /mnt directory cleanup
+    if [ -d "/mnt" ]; then
+        log_debug "Cleaning up any remaining mounts under /mnt..."
+        for mp in /mnt/*; do
+            if [ -d "$mp" ] && mountpoint -q "$mp"; then
+                log_debug "Cleaning up lingering mount: $mp"
+                safe_unmount "$mp" "mount under /mnt"
+            fi
+        done
+    fi
+    
+    # Final verification - list remaining mounts
+    log_debug "Remaining mounts after cleanup:"
+    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+        echo "--- Mounts after cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
+        mount >> "${REAL_ROOT_LOG_FILE}" 2>&1
+        echo "--- End mounts ---" >> "${REAL_ROOT_LOG_FILE}"
+    fi
+    
+    log_msg "Mount cleanup completed"
+}
+
+force_cleanup_efi_mount() {
+    # Specifically target /boot/efi if it's still mounted
+    local efi_mounts="/boot/efi /boot/EFI /efi /EFI"
+    
+    for efi_mount in $efi_mounts; do
+        if mountpoint -q "$efi_mount" 2>/dev/null; then
+            log_msg "Specifically targeting EFI mount: $efi_mount"
+            
+            # Be more aggressive with EFI mounts
+            sync
+            
+            # Try to remount read-only first, then unmount
+            if mount -o remount,ro "$efi_mount" 2>/dev/null; then
+                log_debug "Remounted $efi_mount as read-only"
+            fi
+            
+            # Kill any processes that might be using it
+            fuser -km "$efi_mount" 2>/dev/null || true
+            sleep 2
+            
+            # Force unmount
+            if umount -f "$efi_mount" 2>/dev/null; then
+                log_msg "Successfully force unmounted $efi_mount"
+            else
+                log_msg "Attempting lazy unmount of $efi_mount"
+                umount -l "$efi_mount" || true
+            fi
+        fi
+    done
 }
 
 mountroot()

@@ -10,7 +10,7 @@ DEBUG_MODE="no"
 ZRAM_SIZE_MiB=0
 
 # Compression algorithm (e.g., lz4, zstd, lzo-rle).
-ZRAM_ALGO="zstd"
+ZRAM_ALGO="lz4"
 
 # Filesystem type for ZRAM device (e.g., ext4, btrfs, xfs)
 ZRAM_FS_TYPE="ext4"
