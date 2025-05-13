@@ -1,6 +1,17 @@
 # Local filesystem mounting			-*- shell-script -*-
 # shellcheck shell=sh
 
+# Load DEBUG_MODE from configuration
+DEBUG_MODE="no" # Default value
+CONFIG_FILE="/conf/zramroot-config"
+if [ -f "${CONFIG_FILE}" ]; then
+    # Extract DEBUG_MODE value safely
+    debug_setting=$(grep "^DEBUG_MODE=" "${CONFIG_FILE}" | cut -d'"' -f2)
+    if [ "${debug_setting}" = "yes" ]; then
+        DEBUG_MODE="yes"
+    fi
+fi
+
 # --- Enhanced Logging Functions ---
 # Variables for physical root logging
 REAL_ROOT_MNT="/mnt/real_root_rw"
@@ -18,66 +29,16 @@ zram_log() {
         echo "zramroot: $MSG" > /dev/console 2>/dev/null || true
     fi
     
-    # Log to physical root if mounted and log file exists
-    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
-        now=""
-        if command -v date >/dev/null 2>&1; then
-            now="$(date '+%Y-%m-%d %H:%M:%S')"
+    # Only log to file if DEBUG_MODE=yes or this is an error message
+    if [ "${DEBUG_MODE}" = "yes" ] || echo "$MSG" | grep -q "ERROR"; then
+        if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+            now=""
+            if command -v date >/dev/null 2>&1; then
+                now="$(date '+%Y-%m-%d %H:%M:%S')"
+            fi
+            echo "${now} LOCAL-SCRIPT: $MSG" >> "${REAL_ROOT_LOG_FILE}"
         fi
-        echo "${now} LOCAL-SCRIPT: $MSG" >> "${REAL_ROOT_LOG_FILE}"
     fi
-}
-
-# Logs system state to physical root log
-log_system_state() {
-    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
-        # Separator for readability
-        echo "-------- LOCAL SCRIPT STATE SNAPSHOT --------" >> "${REAL_ROOT_LOG_FILE}"
-        
-        # Log mounted filesystems
-        echo "--- Mounted filesystems:" >> "${REAL_ROOT_LOG_FILE}"
-        mount >> "${REAL_ROOT_LOG_FILE}" 2>&1
-        
-        # Log system parameters
-        echo "--- System Parameters:" >> "${REAL_ROOT_LOG_FILE}"
-        echo "ROOT=${ROOT}" >> "${REAL_ROOT_LOG_FILE}"
-        echo "FSTYPE=${FSTYPE}" >> "${REAL_ROOT_LOG_FILE}"
-        echo "ROOTFLAGS=${ROOTFLAGS}" >> "${REAL_ROOT_LOG_FILE}"
-        echo "ZRAMROOT_DEVICE=${ZRAMROOT_DEVICE}" >> "${REAL_ROOT_LOG_FILE}"
-        echo "ZRAMROOT_FSTYPE=${ZRAMROOT_FSTYPE}" >> "${REAL_ROOT_LOG_FILE}" 
-        echo "ZRAMROOT_ROOTFLAGS=${ZRAMROOT_ROOTFLAGS}" >> "${REAL_ROOT_LOG_FILE}"
-        
-        # Log block devices
-        echo "--- Block devices:" >> "${REAL_ROOT_LOG_FILE}"
-        ls -la /dev/[hsv]d* /dev/mmcblk* /dev/nvme* /dev/zram* 2>/dev/null >> "${REAL_ROOT_LOG_FILE}"
-        
-        # End separator
-        echo "-------------------------------------------" >> "${REAL_ROOT_LOG_FILE}"
-    fi
-}
-
-# Function to finalize log with timestamp and CPU info
-finalize_log() {
-    local status="$1"
-    
-    if [ ! -w "${REAL_ROOT_LOG_FILE}" ]; then
-        return
-    fi
-    
-    local cpu_clock="Unknown"
-    if [ -f /proc/cpuinfo ]; then
-        cpu_clock=$(grep -m1 "MHz" /proc/cpuinfo | awk '{print $4}' || echo "Unknown")
-    fi
-    local date_str=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "Unknown")
-    
-    if [ "${status}" = "success" ]; then
-        echo "=== ZRAMROOT MOUNT COMPLETED SUCCESSFULLY ON ${date_str} | CPU CLOCK: ${cpu_clock} MHz ===" >> "${REAL_ROOT_LOG_FILE}"
-    else
-        echo "=== ZRAMROOT MOUNT FAILED ON ${date_str} | CPU CLOCK: ${cpu_clock} MHz ===" >> "${REAL_ROOT_LOG_FILE}"
-    fi
-    
-    # Ensure log is written to disk
-    sync
 }
 
 local_top()
@@ -272,67 +233,42 @@ local_mount_root()
     if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
         # --- ZRAM Root Path ---
         log_begin_msg "Detected zramroot parameter, attempting ZRAM mount"
-        echo "zramroot: ZRAM root mount process starting" > /dev/kmsg
+        zram_log "ZRAM root mount process starting"
         
-        # Create a unique date-time string for logging
-        DATE_TIME=$(date '+%m-%d-%H%M' 2>/dev/null || echo "unknown")
-        
-        # Log to physical root if mounted
-        if [ -d "/mnt/real_root_rw" ] && mountpoint -q "/mnt/real_root_rw"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [local_script] ZRAM mount starting" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [local_script] Cmdline: $(cat /proc/cmdline)" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-        fi
-
         # Ensure the premount scripts have run
         if [ "${local_premount_used}" != "yes" ]; then
-            echo "zramroot: Running local_premount scripts first" > /dev/kmsg
+            zram_log "Running local_premount scripts first"
             local_premount
         else
-            echo "zramroot: local_premount already executed" > /dev/kmsg
+            zram_log "local_premount already executed"
         fi
 
-        # Try to source variables from the file (better than environment vars)
-        # Try multiple possible locations
+        # Try to source variables from the file
         if [ -f "/conf/zramroot_vars" ]; then
-            echo "zramroot: Sourcing variables from /conf/zramroot_vars" > /dev/kmsg
+            zram_log "Sourcing variables from /conf/zramroot_vars"
             . /conf/zramroot_vars
-            
-            if [ -d "/mnt/real_root_rw" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') [local_script] Sourced variables from /conf/zramroot_vars" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            fi
         elif [ -f "/tmp/zramroot_vars" ]; then
-            echo "zramroot: Sourcing variables from /tmp/zramroot_vars" > /dev/kmsg
+            zram_log "Sourcing variables from /tmp/zramroot_vars"
             . /tmp/zramroot_vars
-            
-            if [ -d "/mnt/real_root_rw" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') [local_script] Sourced variables from /tmp/zramroot_vars" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            fi
         fi
 
         # Check for zramroot-boot script variables
         if [ -z "${ZRAMROOT_DEVICE}" ] || [ -z "${ZRAMROOT_FSTYPE}" ] || [ -z "${ZRAMROOT_ROOTFLAGS}" ]; then
-            echo "zramroot ERROR: Required ZRAM variables not available, using auto-detection" > /dev/kmsg
-            
-            # Log detailed error
-            if [ -d "/mnt/real_root_rw" ] && mountpoint -q "/mnt/real_root_rw"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') ZRAM variables not found, using auto-detection" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-                
-                # Auto-detect zram device
-                if [ -b "/dev/zram0" ]; then
-                    echo "Found /dev/zram0, using it as root device" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-                    ZRAMROOT_DEVICE="/dev/zram0"
-                    ZRAMROOT_FSTYPE="ext4"
-                    ZRAMROOT_ROOTFLAGS="rw,noatime"
-                else
-                    echo "ERROR: Could not find ZRAM device" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-                    panic "ZRAMROOT Error: No ZRAM device found!"
-                fi
+            zram_log "ERROR: Required ZRAM variables not available"
+            # Auto-detect as fallback
+            if [ -b "/dev/zram0" ]; then
+                zram_log "Auto-detected ZRAM device: /dev/zram0"
+                ZRAMROOT_DEVICE="/dev/zram0"
+                ZRAMROOT_FSTYPE="ext4"
+                ZRAMROOT_ROOTFLAGS="rw,noatime"
+            else
+                panic "ZRAMROOT Error: No ZRAM device found!"
             fi
         fi
 
-        echo "zramroot: Using ZRAM device: ${ZRAMROOT_DEVICE}" > /dev/kmsg
-        echo "zramroot: Using ZRAM FSTYPE: ${ZRAMROOT_FSTYPE}" > /dev/kmsg
-        echo "zramroot: Using ZRAM ROOTFLAGS: ${ZRAMROOT_ROOTFLAGS}" > /dev/kmsg
+        zram_log "Using ZRAM device: ${ZRAMROOT_DEVICE}"
+        zram_log "Using ZRAM FSTYPE: ${ZRAMROOT_FSTYPE}"
+        zram_log "Using ZRAM ROOTFLAGS: ${ZRAMROOT_ROOTFLAGS}"
 
         # Set variables for mounting ZRAM root
         ROOT="${ZRAMROOT_DEVICE}"
@@ -341,151 +277,58 @@ local_mount_root()
         roflag="-w"  # ZRAM should always be mounted read-write
 
         # Run local_top scripts
-        echo "zramroot: Running local_top scripts" > /dev/kmsg
+        zram_log "Running local_top scripts"
         local_top
 
         # Skip filesystem check for ZRAM device
-        echo "zramroot: Skipping filesystem check for ZRAM device ${ROOT}" > /dev/kmsg
+        zram_log "Skipping filesystem check for ZRAM device ${ROOT}"
 
-        # Check if ZRAM is already mounted somewhere
-        ZRAM_MOUNTPOINT=$(grep -w "${ROOT}" /proc/mounts | awk '{print $2}')
-        echo "zramroot: Will mount to rootmnt=${rootmnt}" > /dev/kmsg
-        if [ -d "/mnt/real_root_rw" ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') Will mount to rootmnt=${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            
-            if [ -n "${ZRAM_MOUNTPOINT}" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') WARNING: ZRAM already mounted at ${ZRAM_MOUNTPOINT}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            fi
-        fi
-        
         # Make sure rootmnt exists
         mkdir -p "${rootmnt}"
         
-        # If ZRAM is already mounted somewhere, try to move the mount
-        if [ -n "${ZRAM_MOUNTPOINT}" ]; then
-            echo "zramroot: ZRAM already mounted at ${ZRAM_MOUNTPOINT}, attempting mount move" > /dev/kmsg
+        # Mount ZRAM root directly
+        zram_log "Mounting ZRAM root ${ROOT} on ${rootmnt}"
+        
+        # Try mounting with different option formats
+        if ! mount ${roflag} -t "${FSTYPE}" -o "${ROOTFLAGS}" "${ROOT}" "${rootmnt}"; then
+            zram_log "WARNING: First mount attempt failed, trying fallback 1..."
             
-            if [ "${ZRAM_MOUNTPOINT}" = "${rootmnt}" ]; then
-                echo "zramroot: ZRAM already mounted at target location ${rootmnt}, continuing" > /dev/kmsg
-                if [ -d "/mnt/real_root_rw" ]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') ZRAM already mounted at target location ${rootmnt}, continuing" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
+            if ! mount ${roflag} -t "${FSTYPE}" -o "rw,noatime" "${ROOT}" "${rootmnt}"; then
+                zram_log "WARNING: Second mount attempt failed, trying fallback 2..."
+                
+                if ! mount ${roflag} -t "${FSTYPE}" "${ROOT}" "${rootmnt}"; then
+                    zram_log "ERROR: All mount attempts failed"
+                    panic "Failed to mount ZRAM root ${ROOT}!"
+                else
+                    zram_log "Third mount attempt succeeded"
                 fi
             else
-                # Try to move the mount
-                echo "zramroot: Moving mount from ${ZRAM_MOUNTPOINT} to ${rootmnt}" > /dev/kmsg
-                if [ -d "/mnt/real_root_rw" ]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') Moving mount from ${ZRAM_MOUNTPOINT} to ${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-                fi
-                
-                # Create a temporary directory if we're moving from /root
-                if [ "${ZRAM_MOUNTPOINT}" = "/root" ] && [ "${rootmnt}" != "/root" ]; then
-                    # We need to move this mount without disrupting the currently running scripts
-                    # First, bind mount it to a temporary location
-                    mkdir -p /tmp/zram_temp
-                    if mount --bind "${ZRAM_MOUNTPOINT}" /tmp/zram_temp; then
-                        # Then unmount the original
-                        umount "${ZRAM_MOUNTPOINT}"
-                        # Now mount the temporary location to the target
-                        if mount --move /tmp/zram_temp "${rootmnt}"; then
-                            echo "zramroot: Successfully moved mount to ${rootmnt}" > /dev/kmsg
-                        else
-                            echo "zramroot ERROR: Failed to move mount from /tmp/zram_temp to ${rootmnt}" > /dev/kmsg
-                            # Try to recover
-                            mount --move /tmp/zram_temp "${ZRAM_MOUNTPOINT}"
-                        fi
-                    else
-                        echo "zramroot ERROR: Failed to bind mount ${ZRAM_MOUNTPOINT}" > /dev/kmsg
-                    fi
-                else
-                    # Direct move for non-/ mounts
-                    if ! mount --move "${ZRAM_MOUNTPOINT}" "${rootmnt}"; then
-                        echo "zramroot ERROR: Failed to move mount from ${ZRAM_MOUNTPOINT} to ${rootmnt}" > /dev/kmsg
-                        if [ -d "/mnt/real_root_rw" ]; then
-                            echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: Failed to move mount from ${ZRAM_MOUNTPOINT} to ${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-                        fi
-                    else
-                        echo "zramroot: Successfully moved mount to ${rootmnt}" > /dev/kmsg
-                    fi
-                fi
+                zram_log "Second mount attempt succeeded"
             fi
         else
-            # Mount ZRAM root directly to rootmnt
-            echo "zramroot: Mounting ZRAM root ${ROOT} on ${rootmnt}" > /dev/kmsg
-            
-            # Log detailed information about the mount attempt
-            if [ -d "/mnt/real_root_rw" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') Attempting mount command: mount ${roflag} -t ${FSTYPE} -o ${ROOTFLAGS} ${ROOT} ${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            fi
-            
-            # Try mounting with different option formats
-            if ! mount ${roflag} -t "${FSTYPE}" -o "${ROOTFLAGS}" "${ROOT}" "${rootmnt}"; then
-                echo "zramroot WARNING: First mount attempt failed, trying fallback 1..." > /dev/kmsg
-                
-                if ! mount ${roflag} -t "${FSTYPE}" -o "rw,noatime" "${ROOT}" "${rootmnt}"; then
-                    echo "zramroot WARNING: Second mount attempt failed, trying fallback 2..." > /dev/kmsg
-                    
-                    if ! mount ${roflag} -t "${FSTYPE}" "${ROOT}" "${rootmnt}"; then
-                        echo "zramroot ERROR: All mount attempts failed" > /dev/kmsg
-                        
-                        # Log detailed error
-                        if [ -d "/mnt/real_root_rw" ]; then
-                            echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: All mount attempts failed" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-                            echo "ZRAM device status:" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-                            zramctl >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log" 2>&1
-                            
-                            # Check if any mount points are active
-                            echo "Mount points:" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-                            mount >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log" 2>&1
-                        fi
-                        
-                        panic "Failed to mount ZRAM root ${ROOT}!"
-                    else
-                        echo "zramroot: Third mount attempt succeeded" > /dev/kmsg
-                    fi
-                else
-                    echo "zramroot: Second mount attempt succeeded" > /dev/kmsg
-                fi
-            else
-                echo "zramroot: First mount attempt succeeded" > /dev/kmsg
-            fi
+            zram_log "First mount attempt succeeded"
         fi
         
         # Verify mount worked
         if ! mountpoint -q "${rootmnt}"; then
-            echo "zramroot ERROR: Mount verification failed, ${rootmnt} is not a mountpoint" > /dev/kmsg
-            if [ -d "/mnt/real_root_rw" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: Mount verification failed, ${rootmnt} is not a mountpoint" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            fi
+            zram_log "ERROR: Mount verification failed, ${rootmnt} is not a mountpoint"
             panic "ZRAM root mount verification failed!"
         fi
         
         # Mount was successful!
-        echo "zramroot: ZRAM root mounted successfully!" > /dev/kmsg
+        zram_log "ZRAM root mounted successfully!"
         
         # Create directories needed in the ZRAM root
         for dir in dev proc sys run tmp; do
             if [ ! -d "${rootmnt}/${dir}" ]; then
-                echo "zramroot: Creating required directory: ${rootmnt}/${dir}" > /dev/kmsg
+                zram_log "Creating required directory: ${rootmnt}/${dir}"
                 mkdir -p "${rootmnt}/${dir}"
                 chmod 755 "${rootmnt}/${dir}"
             fi
         done
         
-        # Add final log entry
-        if [ -d "/mnt/real_root_rw" ] && mountpoint -q "/mnt/real_root_rw"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') ZRAM root mounted successfully as root filesystem!" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            echo "Mounted device: ${ROOT}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            echo "Mount point: ${rootmnt}" >> "/mnt/real_root_rw/var/log/zramroot-${DATE_TIME}.log"
-            finalize_log "success"
-        fi
-        
         # Mount was successful!
-        echo "zramroot: ZRAM root mounted successfully!" > /dev/kmsg
-        
-        # CREATE THIS SECTION - Add cleanup of other mounts
-        log_msg "Cleaning up non-essential mounts..."
-        cleanup_other_mounts
-        force_cleanup_efi_mount
+        zram_log "ZRAM root mounted successfully!"
         log_end_msg 0
 
     else
@@ -598,138 +441,6 @@ local_mount_fs()
 	if ! mount ${roflag} -t "${MNT_TYPE}" -o "${MNT_OPTS}" "$MNT_FSNAME" "${rootmnt}${MNT_DIR}"; then
 		panic "Failed to mount ${MNT_FSNAME} as $MNT_DIR file system."
 	fi
-}
-
-cleanup_other_mounts() {
-    log_msg "Aggressively cleaning up all non-essential mounted filesystems..."
-    
-    # List of mount points that should definitely be unmounted
-    local boot_mounts_to_cleanup=""
-    local other_mounts_to_cleanup=""
-    
-    # First pass: identify all mounts we need to clean up
-    while IFS=' ' read -r device mount_point fs_type opts freq pass; do
-        # Skip special filesystems that should remain mounted
-        case "$mount_point" in
-            # These are essential and should stay mounted
-            /proc | /sys | /dev | /run | /tmp | "${rootmnt}")
-                continue
-                ;;
-            # These are boot-related and should be unmounted
-            /boot/* | /boot | /efi)
-                log_debug "Found boot mount to cleanup: $device on $mount_point"
-                boot_mounts_to_cleanup="$boot_mounts_to_cleanup $mount_point"
-                ;;
-            *)
-                # Check if this is a physical device mount
-                case "$device" in
-                    /dev/[hsv]d* | /dev/mmcblk* | /dev/nvme* | UUID=* | LABEL=* | PARTUUID=*)
-                        # Don't unmount our logging mount if it's still there
-                        if [ "$mount_point" != "/mnt/real_root_rw" ]; then
-                            log_debug "Found physical mount to cleanup: $device on $mount_point"
-                            other_mounts_to_cleanup="$other_mounts_to_cleanup $mount_point"
-                        fi
-                        ;;
-                esac
-                ;;
-        esac
-    done < /proc/mounts
-    
-    # Function to safely unmount a filesystem
-    safe_unmount() {
-        local mount_point="$1"
-        local description="$2"
-        
-        if ! mountpoint -q "$mount_point"; then
-            log_debug "$description $mount_point is not mounted, skipping"
-            return 0
-        fi
-        
-        log_msg "Unmounting $description: $mount_point"
-        
-        # Kill processes using this mount
-        if command -v fuser >/dev/null; then
-            fuser -km "$mount_point" 2>/dev/null || true
-            sleep 1
-        fi
-        
-        # Try multiple unmount strategies
-        if umount "$mount_point" 2>/dev/null; then
-            log_debug "Successfully unmounted $mount_point"
-            return 0
-        elif umount -f "$mount_point" 2>/dev/null; then
-            log_debug "Force unmounted $mount_point"
-            return 0
-        elif umount -l "$mount_point" 2>/dev/null; then
-            log_debug "Lazy unmounted $mount_point"
-            return 0
-        else
-            log_error "Failed to unmount $mount_point"
-            return 1
-        fi
-    }
-    
-    # Unmount boot-related mounts first (they often depend on other mounts)
-    for mount_point in $boot_mounts_to_cleanup; do
-        safe_unmount "$mount_point" "boot mount"
-    done
-    
-    # Then unmount other physical device mounts
-    for mount_point in $other_mounts_to_cleanup; do
-        safe_unmount "$mount_point" "physical mount"
-    done
-    
-    # Special handling for /mnt directory cleanup
-    if [ -d "/mnt" ]; then
-        log_debug "Cleaning up any remaining mounts under /mnt..."
-        for mp in /mnt/*; do
-            if [ -d "$mp" ] && mountpoint -q "$mp"; then
-                log_debug "Cleaning up lingering mount: $mp"
-                safe_unmount "$mp" "mount under /mnt"
-            fi
-        done
-    fi
-    
-    # Final verification - list remaining mounts
-    log_debug "Remaining mounts after cleanup:"
-    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
-        echo "--- Mounts after cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
-        mount >> "${REAL_ROOT_LOG_FILE}" 2>&1
-        echo "--- End mounts ---" >> "${REAL_ROOT_LOG_FILE}"
-    fi
-    
-    log_msg "Mount cleanup completed"
-}
-
-force_cleanup_efi_mount() {
-    # Specifically target /boot/efi if it's still mounted
-    local efi_mounts="/boot/efi /boot/EFI /efi /EFI"
-    
-    for efi_mount in $efi_mounts; do
-        if mountpoint -q "$efi_mount" 2>/dev/null; then
-            log_msg "Specifically targeting EFI mount: $efi_mount"
-            
-            # Be more aggressive with EFI mounts
-            sync
-            
-            # Try to remount read-only first, then unmount
-            if mount -o remount,ro "$efi_mount" 2>/dev/null; then
-                log_debug "Remounted $efi_mount as read-only"
-            fi
-            
-            # Kill any processes that might be using it
-            fuser -km "$efi_mount" 2>/dev/null || true
-            sleep 2
-            
-            # Force unmount
-            if umount -f "$efi_mount" 2>/dev/null; then
-                log_msg "Successfully force unmounted $efi_mount"
-            else
-                log_msg "Attempting lazy unmount of $efi_mount"
-                umount -l "$efi_mount" || true
-            fi
-        fi
-    done
 }
 
 mountroot()

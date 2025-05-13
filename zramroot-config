@@ -32,9 +32,6 @@ ZRAM_MIN_FREE_MiB=256
 ZRAM_MAX_FREE_MiB=35840
 
 # --- Resource Calculation (Used only if ZRAM_SIZE_MiB is 0) ---
-# Estimated compression ratio (e.g., 2.5 means 10GB original -> 4GB compressed)
-ESTIMATED_COMPRESSION_RATIO=2.5
-
 # Buffer percentage to add to the original used size when calculating ZRAM size automatically.
 ZRAM_BUFFER_PERCENT=10
 
@@ -46,4 +43,4 @@ ZRAM_DEVICE_NUM=0
 TRIGGER_PARAMETER="zramroot"
 
 # Seconds to wait for the real root device to appear
-WAIT_TIMEOUT=30
+WAIT_TIMEOUT=3

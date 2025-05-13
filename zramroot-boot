@@ -2,19 +2,16 @@
 # initramfs-zramroot-boot
 
 # --- Global Variables ---
-CONFIG_FILE="/conf/zramroot-config"
-DEBUG_MODE="no" # Force debug mode on for troubleshooting
+CONFIG_FILE="/conf/zramroot-config" 
+DEBUG_MODE="no" # Will be loaded from config
 REAL_ROOT_DEVICE="" # Will be set from ROOT environment variable
 REAL_ROOT_MNT="/mnt/real_root_rw"  # For persistent logging and copying
-
-# Generate log filename with date/time
-DATE_TIME=$(date '+%m-%d-%H%M' 2>/dev/null || echo "unknown")
+DATE_TIME=$(date '+%m-%d-%H%M' 2>/dev/null || echo "unknown") # Generate log filename with date/time
 REAL_ROOT_LOG_DIR="${REAL_ROOT_MNT}/var/log"
 REAL_ROOT_LOG_FILE="${REAL_ROOT_LOG_DIR}/zramroot-${DATE_TIME}.log"
-
 ZRAM_DEVICE="zram0"
 TRIGGER_PARAMETER="zramroot" # Default trigger word
-WAIT_TIMEOUT=20 # Seconds to wait for the real root device
+WAIT_TIMEOUT=3 # Seconds to wait for the real root device
 ZRAM_DEVICE_NUM=0
 ZRAM_SIZE_MiB=0
 ZRAM_ALGO="lz4"
@@ -31,892 +28,332 @@ BOOT_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "unknown")
 # Use a temporary mount point in /tmp
 ZRAM_TEMP_MNT="/tmp/zram_temp"
 
-# --- Early ARM64 Debug ---
-# Create a very early debug log on the initramfs itself
-EARLY_DEBUG_LOG="/tmp/zramroot_early_debug.log"
-touch "${EARLY_DEBUG_LOG}"
-
-early_debug() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'UNKNOWN_TIME') $@" >> "${EARLY_DEBUG_LOG}"
-    echo "zramroot-early: $@" > /dev/kmsg 2>/dev/null || true
-}
-
-early_debug "ZRAMroot boot script starting"
-early_debug "Kernel cmdline: $(cat /proc/cmdline)"
-
 # --- Logging Functions ---
-# Just log to kernel message buffer
 log_kernel() { 
     echo "zramroot: $@" > /dev/kmsg 2>/dev/null || true
 }
 
-# Log to both kernel and console 
-log_console() {
-    echo "zramroot: $@" > /dev/console 2>/dev/null || true
-    echo "zramroot: $@" > /dev/kmsg 2>/dev/null || true
-}
-
-# Log to physical root log file if available
-log_file() {
-    # Log to early debug too (temporary file in RAM)
-    early_debug "$@"
-    
-    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
-        local timestamp
-        timestamp=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "UNKNOWN_TIME")
-        echo "${timestamp} [${BOOT_ID}] zramroot: $@" >> "${REAL_ROOT_LOG_FILE}"
-    fi
-}
-
-# Combined logging function
-log_msg() {
-    log_kernel "$@"
-    log_console "$@"
-    log_file "$@"
-}
-
-# Debug logging (always on for now during troubleshooting)
 log_debug() {
-    log_msg "DEBUG: $@"
+    if [ "${DEBUG_MODE}" = "yes" ]; then
+        log_kernel "DEBUG: $@"
+    fi
 }
 
-# Error logging
 log_error() {
-    log_msg "ERROR: $@"
+    log_kernel "ERROR: $@"
 }
 
-# --- Debug Hardware Info ---
-log_hardware_info() {
-    # Log to early debug file
-    early_debug "--- Hardware Information ---"
-    
-    # Log CPU info
-    if [ -f /proc/cpuinfo ]; then
-        early_debug "CPU Info:"
-        grep "model name\|Processor\|CPU\|Hardware" /proc/cpuinfo >> "${EARLY_DEBUG_LOG}"
-    fi
-    
-    # Log memory info
-    if [ -f /proc/meminfo ]; then
-        early_debug "Memory Info:"
-        grep "MemTotal\|MemFree\|MemAvailable" /proc/meminfo >> "${EARLY_DEBUG_LOG}"
-    fi
-    
-    # Log loaded modules
-    early_debug "Loaded Modules:"
-    lsmod | head -10 >> "${EARLY_DEBUG_LOG}" 2>/dev/null || early_debug "lsmod not available"
-    
-    # Log block devices
-    early_debug "Block Devices:"
-    ls -la /dev/[hsv]d* /dev/mmcblk* /dev/nvme* 2>/dev/null >> "${EARLY_DEBUG_LOG}" || early_debug "No standard block devices found"
-    
-    # ARM specific devices
-    ls -la /dev/mmcblk* 2>/dev/null >> "${EARLY_DEBUG_LOG}" || early_debug "No MMC block devices found"
-}
+# Check if zramroot parameter is in cmdline before doing anything
+log_kernel "Checking for zramroot parameter in kernel cmdline"
+if ! echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
+    log_debug "No zramroot parameter found - exiting quietly"
+    exit 0
+fi
 
-# Run hardware info logging early
-log_hardware_info
+log_kernel "zramroot parameter found - starting setup"
 
-# --- Ensure early paths exist ---
-early_debug "Creating early directories"
+# Create necessary directories
 mkdir -p /mnt
 mkdir -p /tmp
 mkdir -p "${ZRAM_TEMP_MNT}"
 
-# --- Mount physical root drive for logging ---
-mount_physical_root() {
-    early_debug "Setting up physical root drive for logging..."
-    
-    # Get the real root device from the 'ROOT' env var set by init.sh
-    REAL_ROOT_DEVICE="${ROOT}"
-    if [ -z "${REAL_ROOT_DEVICE}" ]; then
-        early_debug "FATAL: 'root=' kernel parameter value not found in environment."
-        # Try to find root on the kernel command line directly
-        CMDLINE=$(cat /proc/cmdline)
-        ROOT_PARAM=$(echo "$CMDLINE" | tr ' ' '\n' | grep "^root=")
-        if [ -n "$ROOT_PARAM" ]; then
-            REAL_ROOT_DEVICE="${ROOT_PARAM#root=}"
-            early_debug "Found root device in cmdline: ${REAL_ROOT_DEVICE}"
-        else
-            early_debug "Could not find root device in cmdline either."
-            return 1
-        fi
-    fi
-    early_debug "Physical root device specified as: ${REAL_ROOT_DEVICE}"
-    
-    # Create mount point
+# Try to mount physical root for logging (don't fail if this doesn't work)
+REAL_ROOT_DEVICE="${ROOT}"
+if [ -n "${REAL_ROOT_DEVICE}" ]; then
+    log_debug "Attempting to mount physical root ${REAL_ROOT_DEVICE} for logging"
     mkdir -p "${REAL_ROOT_MNT}"
-    if [ ! -d "${REAL_ROOT_MNT}" ]; then
-        early_debug "ERROR: Failed to create mount point ${REAL_ROOT_MNT}"
-        return 1
+    
+    # Try to find the real device
+    real_dev=""
+    if command -v blkid >/dev/null 2>&1; then
+        real_dev=$(blkid -l -t "${REAL_ROOT_DEVICE}" -o device 2>/dev/null)
     fi
     
-    # Wait for the device
-    early_debug "Waiting for physical root device..."
-    local timeout="${WAIT_TIMEOUT}"
-    local waited=0
-    local real_dev=""
-    
-    # Try different ways to find the device
-    while [ $waited -lt $timeout ]; do
-        # Try blkid first
-        if command -v blkid >/dev/null 2>&1; then
-            real_dev=$(blkid -l -t "${REAL_ROOT_DEVICE}" -o device 2>/dev/null)
-        fi
-        
-        # If blkid didn't work, try direct device path
-        if [ -z "$real_dev" ] && [[ "${REAL_ROOT_DEVICE}" == /dev/* ]] && [ -b "${REAL_ROOT_DEVICE}" ]; then
-            real_dev="${REAL_ROOT_DEVICE}"
-        fi
-        
-        # If UUID format, try alternative method
-        if [ -z "$real_dev" ] && [[ "${REAL_ROOT_DEVICE}" == UUID=* ]]; then
-            uuid="${REAL_ROOT_DEVICE#UUID=}"
-            real_dev=$(findfs UUID="$uuid" 2>/dev/null)
-        fi
-        
-        # For ARM64, check for common MMC devices
-        if [ -z "$real_dev" ]; then
-            for dev in /dev/mmcblk0p* /dev/mmcblk1p*; do
-                if [ -b "$dev" ]; then
-                    early_debug "Found potential MMC device: $dev"
-                    # Try mounting it directly
-                    if mount -o ro "$dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
-                        if [ -d "${REAL_ROOT_MNT}/var" ]; then
-                            early_debug "Successfully mounted $dev as root"
-                            real_dev="$dev"
-                            umount "${REAL_ROOT_MNT}"
-                            break
-                        fi
-                        umount "${REAL_ROOT_MNT}"
-                    fi
-                fi
-            done
-        fi
-        
-        if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
-            early_debug "Device found: ${real_dev}"
-            break
-        fi
-        
-        early_debug "Waiting for device... ($waited/$timeout)"
-        sleep 1
-        waited=$((waited + 1))
-    done
-    
-    if [ -z "$real_dev" ] || [ ! -b "$real_dev" ]; then
-        early_debug "ERROR: Failed to find physical root device after ${timeout}s"
-        # Dump all available block devices for debug
-        early_debug "Available block devices:"
-        ls -la /dev/[hsv]d* /dev/mmcblk* /dev/nvme* /dev/sd* >> "${EARLY_DEBUG_LOG}" 2>/dev/null
-        return 1
+    if [ -z "$real_dev" ] && [ "${REAL_ROOT_DEVICE#/dev/}" != "${REAL_ROOT_DEVICE}" ] && [ -b "${REAL_ROOT_DEVICE}" ]; then
+        real_dev="${REAL_ROOT_DEVICE}"
     fi
     
-    # Mount the real root drive READ-WRITE for logging
-    early_debug "Mounting physical root device ${real_dev} read-write at ${REAL_ROOT_MNT}..."
-    
-    # Try different mount options - some ARM systems need noatime
-    if ! mount -o rw "${real_dev}" "${REAL_ROOT_MNT}"; then
-        early_debug "First mount attempt failed, trying with noatime..."
-        if ! mount -o rw,noatime "${real_dev}" "${REAL_ROOT_MNT}"; then
-            early_debug "Second mount attempt failed, trying with noatime,nodiratime..."
-            if ! mount -o rw,noatime,nodiratime "${real_dev}" "${REAL_ROOT_MNT}"; then
-                early_debug "ERROR: Failed to mount physical root device read-write"
-                return 1
-            fi
+    if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
+        if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
+            mkdir -p "${REAL_ROOT_LOG_DIR}"
+            log_debug "Physical root mounted for logging at ${REAL_ROOT_MNT}"
         fi
     fi
-    
-    # Verify mount worked
-    if ! mountpoint -q "${REAL_ROOT_MNT}"; then
-        early_debug "ERROR: Mount appeared to succeed but ${REAL_ROOT_MNT} is not a mountpoint"
-        return 1
-    fi
-    
-    # Create log directory
-    mkdir -p "${REAL_ROOT_LOG_DIR}"
-    if [ ! -d "${REAL_ROOT_LOG_DIR}" ]; then
-        early_debug "ERROR: Failed to create log directory on physical root"
-        umount "${REAL_ROOT_MNT}" || true
-        return 1
-    fi
-    
-    # Initialize log file with header
-    local cpu_clock="Unknown"
-    if [ -f /proc/cpuinfo ]; then
-        cpu_clock=$(grep -m1 "MHz" /proc/cpuinfo | awk '{print $4}' || echo "Unknown")
-    fi
-    local date_str=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "Unknown")
-    
-    echo "=== ZRAMROOT BOOT STARTED ON ${date_str} | CPU CLOCK: ${cpu_clock} MHz | BOOT ID: ${BOOT_ID} ===" > "${REAL_ROOT_LOG_FILE}"
-    echo "Kernel cmdline: $(cat /proc/cmdline)" >> "${REAL_ROOT_LOG_FILE}"
-    
-    # Copy early debug log to persistent storage
-    if [ -f "${EARLY_DEBUG_LOG}" ]; then
-        echo "--- EARLY DEBUG LOG ---" >> "${REAL_ROOT_LOG_FILE}"
-        cat "${EARLY_DEBUG_LOG}" >> "${REAL_ROOT_LOG_FILE}"
-        echo "--- END EARLY DEBUG LOG ---" >> "${REAL_ROOT_LOG_FILE}"
-    fi
-    
-    early_debug "Physical root mounted successfully for logging at ${REAL_ROOT_MNT}"
-    early_debug "Log file initialized at ${REAL_ROOT_LOG_FILE}"
-    return 0
-}
+fi
 
-# Function to properly unmount the physical root after ZRAM setup
-cleanup_physical_mounts() {
-    log_msg "Cleaning up physical mount at ${REAL_ROOT_MNT}..."
-    
-    if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
-        # Sync any pending writes to the log file
-        sync
-        
-        # Close any open file handles to the mount (just in case)
-        fuser -km "${REAL_ROOT_MNT}" 2>/dev/null || true
-        sleep 1
-        
-        # Unmount the physical root
-        if ! umount "${REAL_ROOT_MNT}"; then
-            log_msg "Warning: Regular unmount failed, trying force unmount..."
-            if ! umount -f "${REAL_ROOT_MNT}"; then
-                log_msg "Warning: Force unmount failed, trying lazy unmount..."
-                umount -l "${REAL_ROOT_MNT}" || true
-            fi
-        fi
-        
-        # Verify unmount
-        if mountpoint -q "${REAL_ROOT_MNT}"; then
-            log_error "Failed to unmount physical root at ${REAL_ROOT_MNT}"
-            return 1
-        else
-            log_msg "Successfully unmounted physical root"
-        fi
-    fi
-    
-    # Remove the mount point directory
-    rmdir "${REAL_ROOT_MNT}" 2>/dev/null || true
-    
-    return 0
-}
+# Load configuration
+DEBUG_MODE="no"; ZRAM_SIZE_MiB=0; ZRAM_ALGO="zstd"; ZRAM_FS_TYPE="ext4"
+ZRAM_MOUNT_OPTS="defaults,noatime"; RAM_MIN_FREE_MiB=512
+ZRAM_BUFFER_PERCENT=10
+ZRAM_DEVICE_NUM=0; TRIGGER_PARAMETER="zramroot"; WAIT_TIMEOUT=3
+RAM_PREF_FREE_MiB=1024; ZRAM_MIN_FREE_MiB=256; ZRAM_MAX_FREE_MiB=35840
 
-final_mount_cleanup() {
-    log_msg "Performing final mount cleanup before handing off to local script..."
-    
-    # List all current mounts for debugging
-    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
-        echo "--- Mounts before final cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
-        mount >> "${REAL_ROOT_LOG_FILE}" 2>&1
-        echo "--- End mounts before cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
-    fi
-    
-    # Specifically target common problematic mounts
-    local problematic_mounts="/boot/efi /boot/EFI /efi /EFI /boot"
-    
-    for mount_point in $problematic_mounts; do
-        if mountpoint -q "$mount_point" 2>/dev/null; then
-            log_msg "Final cleanup: unmounting $mount_point"
-            
-            # Aggressive cleanup approach
-            sync
-            fuser -km "$mount_point" 2>/dev/null || true
-            sleep 1
-            
-            # Try different unmount strategies
-            if umount "$mount_point" 2>/dev/null; then
-                log_debug "Successfully unmounted $mount_point"
-            elif umount -f "$mount_point" 2>/dev/null; then
-                log_debug "Force unmounted $mount_point"  
-            elif umount -l "$mount_point" 2>/dev/null; then
-                log_debug "Lazy unmounted $mount_point"
-            else
-                log_debug "Warning: Could not unmount $mount_point in final cleanup"
-            fi
-        fi
-    done
-    
-    # Final mount listing for debugging
-    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
-        echo "--- Mounts after final cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
-        mount >> "${REAL_ROOT_LOG_FILE}" 2>&1
-        echo "--- End mounts after cleanup ---" >> "${REAL_ROOT_LOG_FILE}"
-    fi
-}
+if [ -f "${CONFIG_FILE}" ]; then
+    log_debug "Loading configuration from ${CONFIG_FILE}"
+    . "${CONFIG_FILE}"
+fi
 
-# --- Configuration Loading Function ---
-load_config() {
-    # Set defaults first
-    DEBUG_MODE="no"; ZRAM_SIZE_MiB=0; ZRAM_ALGO="zstd"; ZRAM_FS_TYPE="ext4"
-    ZRAM_MOUNT_OPTS="defaults,noatime"; RAM_MIN_FREE_MiB=512
-    ESTIMATED_COMPRESSION_RATIO=2.5; ZRAM_BUFFER_PERCENT=10
-    ZRAM_DEVICE_NUM=0; TRIGGER_PARAMETER="zramroot"; WAIT_TIMEOUT=20
-    RAM_PREF_FREE_MiB=1024; ZRAM_MIN_FREE_MiB=256; ZRAM_MAX_FREE_MiB=35840
+# Set algorithm-specific compression estimates based on empirical testing
+# These are not user-configurable as ZRAM doesn't allow tuning compression levels
+case "${ZRAM_ALGO}" in
+    "zstd")
+        ESTIMATED_COMPRESSION_RATIO=3.0  # Conservative estimate for zstd
+        ;;
+    "lz4hc")
+        ESTIMATED_COMPRESSION_RATIO=2.5  # Better compression than lz4
+        ;;
+    "lz4")
+        ESTIMATED_COMPRESSION_RATIO=2.0  # Fast but moderate compression
+        ;;
+    "lzo"|"lzo-rle")
+        ESTIMATED_COMPRESSION_RATIO=1.8  # Fastest, but least compression
+        ;;
+    *)
+        ESTIMATED_COMPRESSION_RATIO=2.2  # Safe default for unknown algorithms
+        ;;
+esac
 
-    log_msg "Loading config ${CONFIG_FILE}";
-    if [ -f "${CONFIG_FILE}" ]; then
-        log_msg "Config file found, sourcing...";
-        # Source the config file safely
-        . "${CONFIG_FILE}"
-        log_msg "Config file sourced successfully";
-    else
-        log_msg "Warn: ${CONFIG_FILE} not found. Using defaults.";
-    fi
+log_debug "Using compression ratio estimate of ${ESTIMATED_COMPRESSION_RATIO} for algorithm ${ZRAM_ALGO}"
 
-    # Validate numeric values after sourcing
-    validate_numeric() { 
-        local v="$1"; local x="$2"; local d="$3"; local r='^[0-9]+(\.[0-9]+)?$'
-        if ! echo "$x" | grep -Eq "$r"; then 
-            log_msg "Warn: Invalid $v ('$x'). Using $d."
-            eval "$v=\"$d\""
-            log_debug "$v validation failed, set to $d"
-        else 
-            log_debug "$v validation passed: $x"
-        fi
-    }
-    
-    validate_numeric "ZRAM_SIZE_MiB" "$ZRAM_SIZE_MiB" 0;
-    validate_numeric "RAM_MIN_FREE_MiB" "$RAM_MIN_FREE_MiB" 512;
-    validate_numeric "RAM_PREF_FREE_MiB" "$RAM_PREF_FREE_MiB" 1024;
-    validate_numeric "ZRAM_MIN_FREE_MiB" "$ZRAM_MIN_FREE_MiB" 256;
-    validate_numeric "ZRAM_MAX_FREE_MiB" "$ZRAM_MAX_FREE_MiB" 35840;
-    validate_numeric "ESTIMATED_COMPRESSION_RATIO" "$ESTIMATED_COMPRESSION_RATIO" 2.5;
-    validate_numeric "ZRAM_BUFFER_PERCENT" "$ZRAM_BUFFER_PERCENT" 10;
-    validate_numeric "ZRAM_DEVICE_NUM" "$ZRAM_DEVICE_NUM" 0;
-    validate_numeric "WAIT_TIMEOUT" "$WAIT_TIMEOUT" 20;
+ZRAM_DEVICE="/dev/zram${ZRAM_DEVICE_NUM}"
 
-    # Ensure sane relative values
-    if [ "$RAM_MIN_FREE_MiB" -ge "$RAM_PREF_FREE_MiB" ]; then
-        RAM_PREF_FREE_MiB="$RAM_MIN_FREE_MiB"
-        log_debug "Adjusted RAM_PREF_FREE_MiB to match RAM_MIN_FREE_MiB"
-    fi
-    
-    if [ "$ZRAM_MIN_FREE_MiB" -ge "$ZRAM_MAX_FREE_MiB" ]; then
-        ZRAM_MIN_FREE_MiB="$ZRAM_MAX_FREE_MiB"
-        log_debug "Adjusted ZRAM_MIN_FREE_MiB to match ZRAM_MAX_FREE_MiB"
-    fi
+log_kernel "=== STARTING ZRAM ROOT SETUP PROCESS ==="
 
-    # Set the final ZRAM device path
-    ZRAM_DEVICE="/dev/zram${ZRAM_DEVICE_NUM}";
-    log_debug "ZRAM device set to ${ZRAM_DEVICE}"
-    
-    # Log all config settings
-    log_debug "Configuration:"
-    log_debug "  DEBUG_MODE=${DEBUG_MODE}"
-    log_debug "  ZRAM_SIZE_MiB=${ZRAM_SIZE_MiB}"
-    log_debug "  ZRAM_ALGO=${ZRAM_ALGO}"
-    log_debug "  ZRAM_FS_TYPE=${ZRAM_FS_TYPE}"
-    log_debug "  ZRAM_MOUNT_OPTS=${ZRAM_MOUNT_OPTS}"
-    log_debug "  RAM_MIN_FREE_MiB=${RAM_MIN_FREE_MiB}"
-    log_debug "  RAM_PREF_FREE_MiB=${RAM_PREF_FREE_MiB}"
-    log_debug "  ZRAM_MIN_FREE_MiB=${ZRAM_MIN_FREE_MiB}"
-    log_debug "  ZRAM_MAX_FREE_MiB=${ZRAM_MAX_FREE_MiB}"
-    log_debug "  ESTIMATED_COMPRESSION_RATIO=${ESTIMATED_COMPRESSION_RATIO}"
-    log_debug "  ZRAM_BUFFER_PERCENT=${ZRAM_BUFFER_PERCENT}"
-    log_debug "  ZRAM_DEVICE_NUM=${ZRAM_DEVICE_NUM}"
-    log_debug "  TRIGGER_PARAMETER=${TRIGGER_PARAMETER}"
-    log_debug "  WAIT_TIMEOUT=${WAIT_TIMEOUT}"
-}
+# Check available RAM
+AVAILABLE_RAM_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+if [ -z "$AVAILABLE_RAM_KB" ]; then
+    AVAILABLE_RAM_KB=$(grep MemFree /proc/meminfo | awk '{print $2}')
+fi
 
-# --- Finish and update log file ---
-finalize_log() {
-    local exit_status="$1"
-    
-    if [ ! -w "${REAL_ROOT_LOG_FILE}" ]; then
-        early_debug "Warning: Cannot finalize log - log file not writable"
-        return
-    fi
-    
-    local cpu_clock="Unknown"
-    if [ -f /proc/cpuinfo ]; then
-        cpu_clock=$(grep -m1 "MHz" /proc/cpuinfo | awk '{print $4}' || echo "Unknown")
-    fi
-    local date_str=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "Unknown")
-    
-    if [ "$exit_status" -eq 0 ]; then
-        echo "=== ZRAMROOT BOOT COMPLETED SUCCESSFULLY ON ${date_str} | CPU CLOCK: ${cpu_clock} MHz | BOOT ID: ${BOOT_ID} ===" >> "${REAL_ROOT_LOG_FILE}"
-    else
-        echo "=== ZRAMROOT BOOT FAILED WITH STATUS ${exit_status} ON ${date_str} | CPU CLOCK: ${cpu_clock} MHz | BOOT ID: ${BOOT_ID} ===" >> "${REAL_ROOT_LOG_FILE}"
-    fi
-    
-    # Ensure log is synced to disk
-    sync
-}
+if ! echo "$AVAILABLE_RAM_KB" | grep -q '^[0-9]\+$'; then
+    log_error "Cannot determine available RAM. Cannot proceed."
+    exit 1
+fi
 
-# --- Main Script Logic ---
-main() {
-    early_debug "Entering main function"
-    
-    # Check trigger parameter first
-    early_debug "Checking cmdline for '${TRIGGER_PARAMETER}' parameter..."
-    CMDLINE=$(cat /proc/cmdline)
-    
-    if ! echo " ${CMDLINE} " | grep -q "[[:space:]]${TRIGGER_PARAMETER}[[:space:]]"; then
-        early_debug "Trigger '${TRIGGER_PARAMETER}' not found. Normal boot."
-        return 0 # Exit normally, do not proceed with ZRAM setup
-    fi
-    
-    # If trigger found, mount physical root for logging FIRST
-    early_debug "Trigger '${TRIGGER_PARAMETER}' found. Setting up logging to physical root..."
-    
-    if ! mount_physical_root; then
-        early_debug "ERROR: Failed to mount physical root for logging. Continuing without persistent logs."
-    fi
-    
-    # Now load configuration
-    log_msg "Loading configuration..."
-    load_config
-    log_msg "Configuration loaded successfully"
-    
-    # Begin ZRAM setup process
-    log_msg "=== STARTING ZRAM ROOT SETUP PROCESS ==="
-    
-    # Set exit on error
-    set -e
-    log_debug "Exit on error enabled"
-    
-    # Check if the physical root was mounted properly
-    if [ ! -d "${REAL_ROOT_MNT}" ] || ! mountpoint -q "${REAL_ROOT_MNT}"; then
-        log_error "Physical root not mounted properly. Cannot proceed."
-        return 1
-    fi
-    log_debug "Physical root confirmed mounted at ${REAL_ROOT_MNT}"
-    
-    # --- Perform RAM and Size Calculation ---
-    log_msg "Calculating required ZRAM size..."
-    
-    # Temporarily disable exit on error for calculations
-    set +e
-    
-    # Check available RAM - use multiple methods for ARM compatibility
-    log_debug "Checking available RAM..."
-    
-    # Try MemAvailable first
-    AVAILABLE_RAM_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
-    if [ -z "$AVAILABLE_RAM_KB" ]; then
-        # If MemAvailable isn't found, use MemFree
-        AVAILABLE_RAM_KB=$(grep MemFree /proc/meminfo | awk '{print $2}')
-    fi
-    
-    if ! echo "$AVAILABLE_RAM_KB" | grep -q '^[0-9]\+$'; then
-        log_error "Cannot determine available RAM. Cannot proceed."
-        if [ -f /proc/meminfo ]; then
-            echo "--- Memory info:" >> "${REAL_ROOT_LOG_FILE}"
-            cat /proc/meminfo >> "${REAL_ROOT_LOG_FILE}" 2>&1
-        fi
-        finalize_log 1
-        return 1
-    fi
-    
-    AVAILABLE_RAM_MiB=$((AVAILABLE_RAM_KB / 1024))
-    log_debug "Available RAM: ${AVAILABLE_RAM_MiB} MiB"
-    
-    # Calculate used size of physical root
-    log_debug "Calculating used size on physical root partition..."
+AVAILABLE_RAM_MiB=$((AVAILABLE_RAM_KB / 1024))
+log_debug "Available RAM: ${AVAILABLE_RAM_MiB} MiB"
+
+# Calculate used size of physical root
+if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
     ROOT_USED_KB=$(LC_ALL=POSIX df -k "${REAL_ROOT_MNT}" | awk 'NR==2 {print $3}')
     if ! echo "$ROOT_USED_KB" | grep -q '^[0-9]\+$'; then
         log_error "Could not determine used disk space on ${REAL_ROOT_MNT}."
-        echo "--- Disk usage:" >> "${REAL_ROOT_LOG_FILE}"
-        LC_ALL=POSIX df -k >> "${REAL_ROOT_LOG_FILE}" 2>&1
-        finalize_log 1
-        return 1
+        exit 1
     fi
-    
     ROOT_USED_MiB=$((ROOT_USED_KB / 1024))
-    log_msg "Used size on physical root: ${ROOT_USED_MiB} MiB"
+else
+    # Fallback: estimate 4GB if we can't mount physical root
+    ROOT_USED_MiB=4096
+    log_debug "Could not mount physical root, estimating 4GB"
+fi
+
+log_kernel "Used size on physical root: ${ROOT_USED_MiB} MiB"
+
+# Add buffer to root usage
+BUFFER_MiB=$(awk -v u="$ROOT_USED_MiB" -v p="$ZRAM_BUFFER_PERCENT" 'BEGIN{printf "%.0f", u * p / 100}')
+ROOT_WITH_BUFFER_MiB=$((ROOT_USED_MiB + BUFFER_MiB))
+
+# Calculate expected compressed size using compression ratio
+# This is the key fix: we need to account for compression when sizing ZRAM
+EXPECTED_COMPRESSED_ROOT_MiB=$(awk -v r="$ROOT_WITH_BUFFER_MiB" -v c="$ESTIMATED_COMPRESSION_RATIO" 'BEGIN{printf "%.0f", r / c}')
+log_kernel "Expected compressed size: ${EXPECTED_COMPRESSED_ROOT_MiB} MiB (ratio: ${ESTIMATED_COMPRESSION_RATIO})"
+
+# Determine ZRAM size
+if [ "$ZRAM_SIZE_MiB" -gt 0 ]; then
+    FINAL_ZRAM_SIZE_MiB=$ZRAM_SIZE_MiB
+    log_kernel "Using configured ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+else
+    # Calculate dynamically based on compressed size
+    if [ $((AVAILABLE_RAM_MiB - RAM_MIN_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB - ZRAM_MIN_FREE_MiB)) -le 0 ]; then
+        log_error "Insufficient RAM: Available ${AVAILABLE_RAM_MiB} MiB < Needed $((RAM_MIN_FREE_MiB + EXPECTED_COMPRESSED_ROOT_MiB + ZRAM_MIN_FREE_MiB)) MiB."
+        exit 1
+    fi
     
-    # Add buffer to root usage (combining ramroot's approach with yours)
-    BUFFER_MiB=$(awk -v u="$ROOT_USED_MiB" -v p="$ZRAM_BUFFER_PERCENT" 'BEGIN{printf "%.0f", u * p / 100}')
-    ROOT_WITH_BUFFER_MiB=$((ROOT_USED_MiB + BUFFER_MiB))
-    log_debug "Root size with buffer: ${ROOT_WITH_BUFFER_MiB} MiB (added ${BUFFER_MiB} MiB buffer)"
-    
-    # Determine ZRAM size - use manual if specified, otherwise calculate dynamically
-    if [ "$ZRAM_SIZE_MiB" -gt 0 ]; then
-        # User has specified a fixed ZRAM size
-        FINAL_ZRAM_SIZE_MiB=$ZRAM_SIZE_MiB
-        log_msg "Using configured ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+    if [ $((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB - ZRAM_MIN_FREE_MiB)) -le 0 ]; then
+        FINAL_ZRAM_SIZE_MiB=$((EXPECTED_COMPRESSED_ROOT_MiB + ZRAM_MIN_FREE_MiB))
+        log_kernel "RAM is tight: Using minimum ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+    elif [ $((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB - ZRAM_MAX_FREE_MiB)) -le 0 ]; then
+        EXTRA_ZRAM=$((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB))
+        FINAL_ZRAM_SIZE_MiB=$((EXPECTED_COMPRESSED_ROOT_MiB + EXTRA_ZRAM))
+        log_kernel "Medium RAM availability: Using ${FINAL_ZRAM_SIZE_MiB} MiB for ZRAM"
     else
-        # Calculate dynamically based on available RAM and root size
-        # First check if we have enough RAM
-        if [ $((AVAILABLE_RAM_MiB - RAM_MIN_FREE_MiB - ROOT_WITH_BUFFER_MiB - ZRAM_MIN_FREE_MiB)) -le 0 ]; then
-            log_error "Insufficient RAM: Available ${AVAILABLE_RAM_MiB} MiB < Needed $((RAM_MIN_FREE_MiB + ROOT_WITH_BUFFER_MiB + ZRAM_MIN_FREE_MiB)) MiB."
-            finalize_log 1
-            return 1
-        fi
-        
-        # Determine optimal ZRAM size based on available RAM
-        if [ $((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - ROOT_WITH_BUFFER_MiB - ZRAM_MIN_FREE_MiB)) -le 0 ]; then
-            # Tight on RAM, just use minimum ZRAM free space
-            FINAL_ZRAM_SIZE_MiB=$((ROOT_WITH_BUFFER_MiB + ZRAM_MIN_FREE_MiB))
-            log_msg "RAM is tight: Using minimum ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
-        elif [ $((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - ROOT_WITH_BUFFER_MiB - ZRAM_MAX_FREE_MiB)) -le 0 ]; then
-            # Medium RAM availability, use what we can
-            EXTRA_ZRAM=$((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - ROOT_WITH_BUFFER_MiB))
-            FINAL_ZRAM_SIZE_MiB=$((ROOT_WITH_BUFFER_MiB + EXTRA_ZRAM))
-            log_msg "Medium RAM availability: Using ${FINAL_ZRAM_SIZE_MiB} MiB for ZRAM"
+        FINAL_ZRAM_SIZE_MiB=$((EXPECTED_COMPRESSED_ROOT_MiB + ZRAM_MAX_FREE_MiB))
+        log_kernel "Plenty of RAM: Using maximum ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+    fi
+    
+    # Additional safety check: ensure ZRAM size is reasonable
+    # ZRAM size should be at least the compressed size or we risk running out of space
+    MIN_SAFE_ZRAM=$((EXPECTED_COMPRESSED_ROOT_MiB + (EXPECTED_COMPRESSED_ROOT_MiB / 4)))  # Add 25% safety margin
+    if [ "$FINAL_ZRAM_SIZE_MiB" -lt "$MIN_SAFE_ZRAM" ]; then
+        log_kernel "Adjusting ZRAM size to safe minimum: ${MIN_SAFE_ZRAM} MiB (was ${FINAL_ZRAM_SIZE_MiB} MiB)"
+        FINAL_ZRAM_SIZE_MiB=$MIN_SAFE_ZRAM
+    fi
+fi
+
+# Load zram module if not already loaded
+if ! lsmod | grep -q '^zram '; then
+    log_debug "Loading zram kernel module..."
+    modprobe zram || {
+        log_error "Failed to load zram kernel module!"
+        exit 1
+    }
+fi
+
+# Wait for ZRAM device node to appear
+sleep 3
+if command -v udevadm >/dev/null && [ -x "$(command -v udevadm)" ]; then
+    udevadm settle || log_debug "udev settle failed or not available"
+fi
+
+# Check if ZRAM device exists, if not create/configure it
+if [ ! -b "${ZRAM_DEVICE}" ]; then
+    # Try using zramctl if available
+    if command -v zramctl >/dev/null; then
+        log_debug "Using zramctl to create ZRAM device..."
+        if zramctl --find --size "${FINAL_ZRAM_SIZE_MiB}M" --algorithm "${ZRAM_ALGO}" >/dev/null 2>&1; then
+            ZRAM_DEVICE=$(zramctl --output NAME --noheadings | head -1)
+            log_debug "Created ZRAM device: ${ZRAM_DEVICE}"
         else
-            # Plenty of RAM, use maximum ZRAM free space
-            FINAL_ZRAM_SIZE_MiB=$((ROOT_WITH_BUFFER_MiB + ZRAM_MAX_FREE_MiB))
-            log_msg "Plenty of RAM: Using maximum ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+            log_debug "zramctl failed, trying manual approach..."
+            # Fall back to manual configuration
+            echo "${ZRAM_ALGO}" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/comp_algorithm 2>/dev/null || true
+            echo "${FINAL_ZRAM_SIZE_MiB}M" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/disksize 2>/dev/null
         fi
-    fi
-    
-    # Re-enable exit on error for ZRAM setup
-    set -e
-    
-    # --- ZRAM Device Setup ---
-    log_msg "Setting up ZRAM device ${ZRAM_DEVICE}..."
-    
-    # Log module list before loading zram
-    log_debug "Modules before loading zram:"
-    lsmod | head -10 >> "${REAL_ROOT_LOG_FILE}" 2>&1
-    
-    # Load zram module if not already loaded
-    if ! lsmod | grep -q '^zram '; then
-        log_debug "Loading zram kernel module..."
-        modprobe zram || {
-            log_error "Failed to load zram kernel module!"
-            finalize_log 1
-            return 1
-        }
-        log_debug "zram module loaded successfully"
     else
-        log_debug "zram module already loaded"
+        # No zramctl, try manual configuration
+        log_debug "zramctl not available, using manual configuration..."
+        echo "${ZRAM_ALGO}" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/comp_algorithm 2>/dev/null || true
+        echo "${FINAL_ZRAM_SIZE_MiB}M" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/disksize 2>/dev/null
     fi
-    
-    # Wait for ZRAM device node to appear
-    log_debug "Waiting for ZRAM device node ${ZRAM_DEVICE}..."
-    sleep 3 # Give module/udev more time for ARM
-    if command -v udevadm >/dev/null && [ -x "$(command -v udevadm)" ]; then
-        udevadm settle || log_debug "udev settle failed or not available"
-    fi
-    
-    # Try to create the zram device if it doesn't exist
-    if [ ! -b "${ZRAM_DEVICE}" ]; then
-        log_debug "ZRAM device node not found, trying to create via zramctl..."
-        zramctl --find --size "${FINAL_ZRAM_SIZE_MiB}M" --algorithm "${ZRAM_ALGO}" || {
-            log_error "Failed to create ZRAM device!"
-            finalize_log 1
-            return 1
-        }
-        
-        # Refresh the ZRAM device path
-        ZRAM_DEVICE=$(zramctl --output NAME --noheadings | head -1)
-        log_debug "Created ZRAM device: ${ZRAM_DEVICE}"
-    else
-        # Configure ZRAM device size and algorithm
-        log_msg "Configuring ZRAM: size=${FINAL_ZRAM_SIZE_MiB}M, algorithm=${ZRAM_ALGO}"
-        if ! zramctl "${ZRAM_DEVICE}" --size "${FINAL_ZRAM_SIZE_MiB}M" --algorithm "${ZRAM_ALGO}"; then
-            log_error "Failed to configure ZRAM device!"
-            echo "zramctl output:" >> "${REAL_ROOT_LOG_FILE}"
-            zramctl >> "${REAL_ROOT_LOG_FILE}" 2>&1
-            finalize_log 1
-            return 1
+else
+    # Device exists, check if it's configured
+    if [ -f "/sys/class/block/zram${ZRAM_DEVICE_NUM}/disksize" ]; then
+        current_size=$(cat /sys/class/block/zram${ZRAM_DEVICE_NUM}/disksize 2>/dev/null || echo "0")
+        if [ "$current_size" = "0" ]; then
+            log_debug "ZRAM device exists but not configured, configuring now..."
+            echo "${ZRAM_ALGO}" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/comp_algorithm 2>/dev/null || true
+            echo "${FINAL_ZRAM_SIZE_MiB}M" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/disksize 2>/dev/null
+        else
+            log_debug "ZRAM device already configured"
         fi
     fi
-    
-    # Verify ZRAM device exists
-    if [ ! -b "${ZRAM_DEVICE}" ]; then
-        log_error "ZRAM device does not exist after configuration!"
-        # List all block devices for debugging
-        ls -la /dev/[hsv]d* /dev/mmcblk* /dev/nvme* /dev/zram* >> "${REAL_ROOT_LOG_FILE}" 2>&1
-        finalize_log 1
-        return 1
-    fi
-    log_debug "ZRAM device configured successfully"
-    
-    # Log ZRAM status
-    log_debug "ZRAM device status:"
-    zramctl >> "${REAL_ROOT_LOG_FILE}" 2>&1
-    
-    # --- Format ZRAM filesystem ---
-    log_msg "Formatting ZRAM device with ${ZRAM_FS_TYPE} filesystem..."
-    mkfs_cmd="mkfs.${ZRAM_FS_TYPE}"
-    mkfs_opts=""
-    
-    # Check if mkfs command exists
-    if ! command -v ${mkfs_cmd} >/dev/null; then
-        log_error "Filesystem utility ${mkfs_cmd} not found in initramfs!"
-        echo "Available commands:" >> "${REAL_ROOT_LOG_FILE}"
-        ls -la /sbin/mkfs* >> "${REAL_ROOT_LOG_FILE}" 2>&1
-        finalize_log 1
-        return 1
-    fi
-    
-    # Add specific options for filesystem types
-    if [ "$ZRAM_FS_TYPE" = "ext4" ]; then 
-        mkfs_opts="-F"
-    elif [ "$ZRAM_FS_TYPE" = "btrfs" ]; then
-        mkfs_opts="-f"
-    fi
-    
-    # Format the ZRAM device
-    log_debug "Running: ${mkfs_cmd} ${mkfs_opts} ${ZRAM_DEVICE}"
-    if ! ${mkfs_cmd} ${mkfs_opts} "${ZRAM_DEVICE}" >> "${REAL_ROOT_LOG_FILE}" 2>&1; then
-        log_error "Failed to format ZRAM device!"
-        finalize_log 1
-        return 1
-    fi
-    log_msg "ZRAM device formatted successfully"
-    
-    # --- Mount ZRAM as root ---
-    log_msg "Mounting ZRAM device ${ZRAM_DEVICE} as root (temporarily at ${ZRAM_TEMP_MNT})..."
-    
-    # Create temporary mount point for ZRAM root
-    mkdir -p "${ZRAM_TEMP_MNT}"
-    
-    # Mount ZRAM filesystem
-    if ! mount -t "${ZRAM_FS_TYPE}" -o "rw,${ZRAM_MOUNT_OPTS}" "${ZRAM_DEVICE}" "${ZRAM_TEMP_MNT}"; then
-        log_error "Failed to mount ZRAM device at ${ZRAM_TEMP_MNT}!"
-        finalize_log 1
-        return 1
-    fi
-    log_debug "ZRAM device mounted successfully at ${ZRAM_TEMP_MNT}"
-    
-    # --- Copy filesystem from physical root to ZRAM ---
-    log_msg "Copying root filesystem from ${REAL_ROOT_MNT} to ZRAM..."
-    
-    # Enable extended glob patterns
-    set -f
-    
-    # Define rsync command with exclusions
-    RSYNC_EXCLUDE="--exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found --exclude=/var/log/journal/*"
-    
-    # Create a simple progress file
-    echo "Starting rsync copy..." > "/tmp/rsync_progress.txt"
-    
-    # Define rsync command
-    RSYNC_CMD="rsync -ax --delete ${RSYNC_EXCLUDE} ${REAL_ROOT_MNT}/ ${ZRAM_TEMP_MNT}/"
-    
-    log_debug "Rsync command: ${RSYNC_CMD}"
-    
-    # Execute rsync with progress indicator
-    log_msg "Starting filesystem copy..."
-    
-    # Record start time for rsync
-    RSYNC_START_TIME=$(date +%s 2>/dev/null || echo 0)
-    
-    # Execute rsync with basic progress reporting
-    i=0
-    if ! eval "${RSYNC_CMD}"; then
-        log_error "Rsync failed to copy files from physical root to ZRAM!"
-        
-        # Check if any files were copied
-        log_debug "Checking files in ZRAM root..."
-        local copied_dirs=$(find ${ZRAM_TEMP_MNT} -maxdepth 1 -type d | wc -l)
-        log_debug "Found ${copied_dirs} directories in ZRAM root"
-        
-        # Log disk space
-        log_debug "ZRAM disk space:"
-        df -h ${ZRAM_TEMP_MNT} >> "${REAL_ROOT_LOG_FILE}" 2>&1
+fi
 
-        log_msg "DEBUG: Syncing filesystem before unmounting..."
-        sync
-        sleep 1  # Give it a moment to complete
+# Wait a bit more for device to be ready
+sleep 2
 
-        # Unmount ZRAM
-        umount ${ZRAM_TEMP_MNT} || log_debug "Warning: Failed to unmount ${ZRAM_TEMP_MNT}"
+# Verify ZRAM device exists
+if [ ! -b "${ZRAM_DEVICE}" ]; then
+    log_error "ZRAM device does not exist after configuration!"
+    exit 1
+fi
+
+log_debug "ZRAM device configured successfully"
+
+# Format ZRAM filesystem
+log_kernel "Formatting ZRAM device with ${ZRAM_FS_TYPE} filesystem..."
+mkfs_cmd="mkfs.${ZRAM_FS_TYPE}"
+mkfs_opts=""
+
+if ! command -v ${mkfs_cmd} >/dev/null; then
+    log_error "Filesystem utility ${mkfs_cmd} not found in initramfs!"
+    exit 1
+fi
+
+# Add specific options for filesystem types
+if [ "$ZRAM_FS_TYPE" = "ext4" ]; then 
+    mkfs_opts="-F"
+elif [ "$ZRAM_FS_TYPE" = "btrfs" ]; then
+    mkfs_opts="-f"
+fi
+
+if ${mkfs_cmd} ${mkfs_opts} "${ZRAM_DEVICE}" >/dev/null 2>&1; then
+    log_kernel "ZRAM device formatted successfully"
+else
+    log_error "Failed to format ZRAM device!"
+    exit 1
+fi
+
+# Now mount ZRAM temporarily and copy files
+mkdir -p "${ZRAM_TEMP_MNT}"
+if mount -t "${ZRAM_FS_TYPE}" -o "rw,${ZRAM_MOUNT_OPTS}" "${ZRAM_DEVICE}" "${ZRAM_TEMP_MNT}"; then
+    log_debug "ZRAM device mounted at ${ZRAM_TEMP_MNT}"
+    
+    # Copy filesystem from physical root to ZRAM ONLY if we successfully mounted physical root
+    if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
+        log_kernel "Copying root filesystem from ${REAL_ROOT_MNT} to ZRAM..."
         
-        finalize_log 1
-        return 1
-    fi
-    
-    # Calculate rsync duration
-    RSYNC_END_TIME=$(date +%s 2>/dev/null || echo 0)
-    RSYNC_DURATION=0
-    if [ "$RSYNC_START_TIME" != "0" ] && [ "$RSYNC_END_TIME" != "0" ]; then
-        RSYNC_DURATION=$((RSYNC_END_TIME - RSYNC_START_TIME))
-    fi
-    log_msg "Filesystem copy completed successfully in ${RSYNC_DURATION} seconds"
-    
-    # Verify critical directories exist in ZRAM root
-    log_debug "Verifying critical directories in ZRAM root..."
-    for dir in bin sbin lib usr etc var; do
-        if [ ! -d "${ZRAM_TEMP_MNT}/${dir}" ]; then
-            log_error "Critical directory '${dir}' missing in ZRAM root!"
-            umount ${ZRAM_TEMP_MNT} || log_debug "Warning: Failed to unmount ${ZRAM_TEMP_MNT}"
-            finalize_log 1
-            return 1
-        fi
-        log_debug "Directory '${dir}' exists in ZRAM root"
-    done
-    
-    log_msg "Setting up hostname configuration..."
-
-    # Make sure the hostname is properly set in /etc/hosts
-    if [ -f "${ZRAM_TEMP_MNT}/etc/hostname" ]; then
-        HOSTNAME=$(cat "${ZRAM_TEMP_MNT}/etc/hostname" | tr -d '[:space:]')
-        if [ -n "$HOSTNAME" ] && [ -f "${ZRAM_TEMP_MNT}/etc/hosts" ]; then
-            # Check if hostname already exists in hosts file
-            if ! grep -q "\s${HOSTNAME}$" "${ZRAM_TEMP_MNT}/etc/hosts"; then
-                # Add hostname to localhost entries
-                log_msg "Adding ${HOSTNAME} to /etc/hosts"
-                sed -i "s/^127\.0\.0\.1\s\+localhost/127.0.0.1\tlocalhost ${HOSTNAME}/" "${ZRAM_TEMP_MNT}/etc/hosts"
-                sed -i "s/^::1\s\+localhost/::1\tlocalhost ${HOSTNAME}/" "${ZRAM_TEMP_MNT}/etc/hosts"
+        # Define rsync command with exclusions
+        RSYNC_EXCLUDE="--exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found --exclude=/var/log/journal/*"
+        RSYNC_CMD="rsync -ax --delete ${RSYNC_EXCLUDE} ${REAL_ROOT_MNT}/ ${ZRAM_TEMP_MNT}/"
+        
+        if eval "${RSYNC_CMD}" >/dev/null 2>&1; then
+            log_kernel "Filesystem copy completed successfully"
             
-                # Add dedicated entry if not already present
-                if ! grep -q "^127\.0\.1\.1" "${ZRAM_TEMP_MNT}/etc/hosts"; then
-                    echo "127.0.1.1\t${HOSTNAME}" >> "${ZRAM_TEMP_MNT}/etc/hosts"
-                fi
+            # Create required directories in ZRAM root
+            for dir in dev proc sys run tmp; do
+                mkdir -p "${ZRAM_TEMP_MNT}/${dir}"
+                chmod 755 "${ZRAM_TEMP_MNT}/${dir}"
+            done
+            
+            # Modify /etc/fstab in ZRAM root
+            if [ -f "${ZRAM_TEMP_MNT}/etc/fstab" ]; then
+                cp "${ZRAM_TEMP_MNT}/etc/fstab" "${ZRAM_TEMP_MNT}/etc/fstab.zram_backup"
+                sed -i -E "s|^([^#].*\s+/\s+.*)$|# ZRAMROOT: \1|g" "${ZRAM_TEMP_MNT}/etc/fstab"
+                sed -i -E "s|^([^#].*\s+(/boot|/boot/efi|/home|/var)\s+.*)$|# ZRAMROOT: \1|g" "${ZRAM_TEMP_MNT}/etc/fstab"
             fi
+        else
+            log_error "Rsync failed to copy files from physical root to ZRAM!"
+            exit 1
         fi
-    fi
-
-    # Modify /etc/fstab in ZRAM root to prevent mounting the original partitions
-    log_debug "Modifying /etc/fstab in ZRAM root..."
-    if [ -f "${ZRAM_TEMP_MNT}/etc/fstab" ]; then
-        # Create a backup of the original fstab
-        cp "${ZRAM_TEMP_MNT}/etc/fstab" "${ZRAM_TEMP_MNT}/etc/fstab.zram_backup"
-        
-        # Comment out root and other mounted partitions
-        sed -i -E "s|^([^#].*\s+/\s+.*)$|# ZRAMROOT: \1|g" "${ZRAM_TEMP_MNT}/etc/fstab"
-        
-        # Also comment out any other partitions we don't need in the ZRAM environment
-        sed -i -E "s|^([^#].*\s+(/boot|/boot/efi|/home|/var)\s+.*)$|# ZRAMROOT: \1|g" "${ZRAM_TEMP_MNT}/etc/fstab"
-        
-        log_debug "Modified /etc/fstab in ZRAM root"
-        log_msg "DEBUG: fstab modification complete, contents:"
-        head -n 20 "${ZRAM_TEMP_MNT}/etc/fstab" >> "${REAL_ROOT_LOG_FILE}" 2>&1
-        log_msg "DEBUG: Creating required mount points in ZRAM root..."
     else
-        log_debug "Warning: /etc/fstab not found in ZRAM root"
+        log_debug "Physical root not mounted, assuming ZRAM already has filesystem"
     fi
     
-    # Create required directories in ZRAM root
-    for dir in dev proc sys run tmp; do
-        if [ ! -d "${ZRAM_TEMP_MNT}/${dir}" ]; then
-            mkdir -p "${ZRAM_TEMP_MNT}/${dir}"
-            log_msg "DEBUG: Created directory ${ZRAM_TEMP_MNT}/${dir}"
-        else
-            log_msg "DEBUG: Directory ${ZRAM_TEMP_MNT}/${dir} already exists"
-        fi
-        # Verify permissions
-        chmod 755 "${ZRAM_TEMP_MNT}/${dir}"
-        log_msg "DEBUG: Set permissions on ${ZRAM_TEMP_MNT}/${dir}"
-    done
-
-    # Sync filesystem to ensure all changes are written
-    log_msg "Syncing filesystem before unmounting..."
+    # Sync and unmount
     sync
     sleep 1
-    
-    # Verify ZRAM is actually mounted before trying to unmount
-    if ! mountpoint -q "${ZRAM_TEMP_MNT}"; then
-        log_error "${ZRAM_TEMP_MNT} is not a mountpoint! Skipping unmount..."
-    else
-        # Unmount ZRAM root temporarily
-        log_msg "Unmounting ZRAM root temporarily..."
-        if ! umount "${ZRAM_TEMP_MNT}"; then
-            log_error "Failed to unmount ZRAM root from ${ZRAM_TEMP_MNT}!"
-            
-            # Try to force unmount if regular unmount fails
-            log_msg "Attempting to force unmount..."
-            if ! umount -f "${ZRAM_TEMP_MNT}"; then
-                log_error "Force unmount failed! Last resort trying lazy unmount..."
-                umount -l "${ZRAM_TEMP_MNT}" || true
-                sleep 2
-            fi
-        fi
-        
-        # Verify the unmount actually worked
-        if mountpoint -q "${ZRAM_TEMP_MNT}"; then
-            log_error "ZRAM root is still mounted at ${ZRAM_TEMP_MNT} after unmount attempts!"
-            log_error "This may cause problems during the switch_root process"
-            # Don't return error here - we'll continue and let the local script handle it
-        else
-            log_msg "ZRAM root successfully unmounted from ${ZRAM_TEMP_MNT}"
-        fi
-    fi
-    
-    # --- Export Variables for local script ---
-    log_msg "DEBUG: Setting up variables for final ZRAM root mounting..."
-    
-    # Calculate final mount options (ensure rw is included)
-    final_mount_opts=$(echo "${ZRAM_MOUNT_OPTS},rw" | sed 's/,defaults//g; s/,ro//g; s/,rw,rw/,rw/g; s/^,\|,$//g')
-    [ -z "$final_mount_opts" ] && final_mount_opts="rw"
-    
-    # Export ZRAM variables for use by the local script
-    log_msg "Setting ZRAMROOT Variables...:"
-    export ZRAMROOT_DEVICE="${ZRAM_DEVICE}"
-    export ZRAMROOT_FSTYPE="${ZRAM_FS_TYPE}"
-    export ZRAMROOT_ROOTFLAGS="${final_mount_opts}"
-
-    mkdir -p /conf
-    echo "ZRAMROOT_DEVICE=${ZRAM_DEVICE}" > /conf/zramroot_vars
-    echo "ZRAMROOT_FSTYPE=${ZRAM_FS_TYPE}" >> /conf/zramroot_vars
-    echo "ZRAMROOT_ROOTFLAGS=${final_mount_opts}" >> /conf/zramroot_vars
-    chmod 644 /conf/zramroot_vars
-
-    # Also write to a file that can be sourced by the local script as a backup
-    echo "ZRAMROOT_DEVICE=${ZRAM_DEVICE}" > /tmp/zramroot_vars
-    echo "ZRAMROOT_FSTYPE=${ZRAM_FS_TYPE}" >> /tmp/zramroot_vars
-    echo "ZRAMROOT_ROOTFLAGS=${final_mount_opts}" >> /tmp/zramroot_vars
-
-    log_msg "ZRAMROOT_DEVICE=${ZRAM_DEVICE}"
-    log_msg "ZRAMROOT_DEVICE set"
-    log_msg "ZRAMROOT_FSTYPE=${ZRAM_FS_TYPE}"
-    log_msg "ZRAMROOT_FSTYPE set"
-    log_msg "ZRAMROOT_ROOTFLAGS=${final_mount_opts}"
-    log_msg "ZRAMROOT_ROOTFLAGS set"
-
-    # Success! ZRAM root is prepared
-    log_msg "ZRAM root preparation complete!"
-    
-    # DO NOT unmount the physical root - we want it to stay mounted for logging
-    log_debug "Keeping physical root mounted at ${REAL_ROOT_MNT} for logging"
-    
-    # Add success message to log
-    finalize_log 0
-    
-    log_msg "===== ZRAM ROOT PREPARATION SCRIPT FINISHED SUCCESSFULLY ====="
-    return 0
-}
-
-# --- Entry point ---
-# Check if zramroot parameter is in cmdline before doing anything
-early_debug "Checking for zramroot parameter in kernel cmdline"
-if ! echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
-    early_debug "No zramroot parameter found - exiting quietly"
-    exit 0
+    umount "${ZRAM_TEMP_MNT}" || {
+        log_error "Failed to unmount ZRAM root!"
+        exit 1
+    }
+    log_debug "ZRAM root unmounted successfully"
+else
+    log_error "Failed to mount ZRAM device for file copy!"
+    exit 1
 fi
 
-# If we get here, zramroot parameter was found - run the main function
-early_debug "zramroot parameter found - starting main function"
-main
-exit_code=$?
+# Calculate final mount options
+final_mount_opts=$(echo "${ZRAM_MOUNT_OPTS},rw" | sed 's/,defaults//g; s/,ro//g; s/,rw,rw/,rw/g; s/^,\|,$//g')
+[ -z "$final_mount_opts" ] && final_mount_opts="rw"
 
-# If exiting with error, ensure logs are finalized
-if [ $exit_code -ne 0 ]; then
-    early_debug "zramroot-boot script failed with code ${exit_code}"
-    log_kernel "zramroot-boot script failed with code ${exit_code}"
-    finalize_log $exit_code
-    
-    # Copy early debug log to a location that will be visible after boot failure
-    if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
-        cp "${EARLY_DEBUG_LOG}" "${REAL_ROOT_MNT}/zramroot_debug.log" 2>/dev/null || true
-    fi
-    
-    # Note: We do NOT unmount the physical root logging filesystem on error
-    # This ensures logs are available for debugging
-    
-    panic "ZRAMROOT: Preparation script failed. See ${REAL_ROOT_LOG_FILE} for details."
+# Export ZRAM variables for use by the local script
+log_kernel "Setting ZRAMROOT Variables..."
+export ZRAMROOT_DEVICE="${ZRAM_DEVICE}"
+export ZRAMROOT_FSTYPE="${ZRAM_FS_TYPE}"
+export ZRAMROOT_ROOTFLAGS="${final_mount_opts}"
+
+mkdir -p /conf
+echo "ZRAMROOT_DEVICE=${ZRAM_DEVICE}" > /conf/zramroot_vars
+echo "ZRAMROOT_FSTYPE=${ZRAM_FS_TYPE}" >> /conf/zramroot_vars
+echo "ZRAMROOT_ROOTFLAGS=${final_mount_opts}" >> /conf/zramroot_vars
+chmod 644 /conf/zramroot_vars
+
+# Also write to tmp as backup
+echo "ZRAMROOT_DEVICE=${ZRAM_DEVICE}" > /tmp/zramroot_vars
+echo "ZRAMROOT_FSTYPE=${ZRAM_FS_TYPE}" >> /tmp/zramroot_vars
+echo "ZRAMROOT_ROOTFLAGS=${final_mount_opts}" >> /tmp/zramroot_vars
+
+log_kernel "ZRAMROOT_DEVICE=${ZRAM_DEVICE}"
+log_kernel "ZRAMROOT_FSTYPE=${ZRAM_FS_TYPE}"
+log_kernel "ZRAMROOT_ROOTFLAGS=${final_mount_opts}"
+
+# Cleanup physical root mount if we mounted it
+if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
+    log_debug "Unmounting physical root"
+    sync
+    umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
 fi
 
-# After ZRAM is prepared and variables are exported, unmount the physical root
-log_msg "Preparing to unmount physical root drive..."
-
-# First, finalize the log with success
-finalize_log 0
-
-# Give file system a moment to flush the log
-sync
-sleep 1
-
-# Now unmount the physical root
-if ! cleanup_physical_mounts; then
-    log_error "Warning: Could not properly unmount physical root"
-    # Don't fail here - ZRAM is ready, just warn about the lingering mount
-fi
-
-final_mount_cleanup
-
-early_debug "zramroot-boot script completed successfully with code ${exit_code}"
-exit $exit_code
+log_kernel "===== ZRAM ROOT PREPARATION SCRIPT FINISHED SUCCESSFULLY ====="
+exit 0
