@@ -15,7 +15,45 @@ fi
 # --- Enhanced Logging Functions ---
 # Variables for physical root logging
 REAL_ROOT_MNT="/mnt/real_root_rw"
-REAL_ROOT_LOG_FILE="${REAL_ROOT_MNT}/var/log/zramroot.log"
+DATE_TIME=$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo "unknown") 
+REAL_ROOT_LOG_FILE="${REAL_ROOT_MNT}/var/log/zramroot-local-${DATE_TIME}.log"
+
+# Function to ensure physical root is mounted for logging
+ensure_physical_root_mounted() {
+    # Only attempt if not already mounted and we're in zramroot mode
+    if [ ! -d "${REAL_ROOT_MNT}" ] || ! mountpoint -q "${REAL_ROOT_MNT}"; then
+        if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
+            mkdir -p "${REAL_ROOT_MNT}"
+            
+            # Try to get the original root device from environment or cmdline
+            local orig_root="${ROOT}"
+            if [ -z "$orig_root" ]; then
+                # Extract from kernel command line
+                orig_root=$(cat /proc/cmdline | grep -oE 'root=[^[:space:]]+' | cut -d'=' -f2)
+            fi
+            
+            if [ -n "$orig_root" ]; then
+                # Resolve the device if it's UUID/LABEL format
+                local real_dev=""
+                if echo "${orig_root}" | grep -q "^UUID=\|^LABEL="; then
+                    if command -v blkid >/dev/null 2>&1; then
+                        real_dev=$(blkid -l -t "${orig_root}" -o device 2>/dev/null)
+                    fi
+                elif [ "${orig_root#/dev/}" != "${orig_root}" ] && [ -b "${orig_root}" ]; then
+                    real_dev="${orig_root}"
+                fi
+                
+                # Try to mount the physical root
+                if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
+                    if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
+                        mkdir -p "${REAL_ROOT_MNT}/var/log"
+                        touch "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+                    fi
+                fi
+            fi
+        fi
+    fi
+}
 
 # Logs to the physical root log file if available
 zram_log() {
@@ -31,13 +69,59 @@ zram_log() {
     
     # Only log to file if DEBUG_MODE=yes or this is an error message
     if [ "${DEBUG_MODE}" = "yes" ] || echo "$MSG" | grep -q "ERROR"; then
+        # Ensure physical root is mounted for logging
+        ensure_physical_root_mounted
+        
         if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
             now=""
             if command -v date >/dev/null 2>&1; then
                 now="$(date '+%Y-%m-%d %H:%M:%S')"
             fi
             echo "${now} LOCAL-SCRIPT: $MSG" >> "${REAL_ROOT_LOG_FILE}"
+        elif [ "${DEBUG_MODE}" = "yes" ]; then
+            # If we can't write to log file but debug is on, try to create it
+            ensure_physical_root_mounted
         fi
+    fi
+}
+
+# --- Safe Sync Function ---
+safe_sync() {
+    local timeout=${1:-5}  # Default 5 second timeout for less critical syncs
+    local desc=${2:-"filesystem"}
+    
+    zram_log "Starting safe sync for $desc (timeout: ${timeout}s)"
+    
+    # Use timeout command if available
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout $timeout sync; then
+            zram_log "Sync completed successfully"
+            return 0
+        else
+            zram_log "Sync timed out after ${timeout} seconds"
+            return 1
+        fi
+    else
+        # Fallback: start sync in background and monitor
+        sync &
+        local sync_pid=$!
+        local count=0
+        
+        while [ $count -lt $timeout ]; do
+            if ! kill -0 $sync_pid 2>/dev/null; then
+                wait $sync_pid
+                local exit_code=$?
+                zram_log "Sync completed (exit code: $exit_code)"
+                return $exit_code
+            fi
+            sleep 1
+            count=$((count + 1))
+        done
+        
+        # Timeout reached
+        zram_log "Sync timed out after ${timeout} seconds, killing sync process"
+        kill -9 $sync_pid 2>/dev/null
+        return 1
     fi
 }
 
@@ -327,8 +411,13 @@ local_mount_root()
             fi
         done
         
-        # Mount was successful!
-        zram_log "ZRAM root mounted successfully!"
+        # FIXED: Add safe_sync before proceeding
+        zram_log "Syncing ZRAM filesystem before continuing..."
+        if ! safe_sync 3 "ZRAM root filesystem"; then
+            zram_log "WARNING: ZRAM sync timed out, but continuing anyway"
+        fi
+        
+        zram_log "ZRAM root mount process completed successfully"
         log_end_msg 0
 
     else
@@ -414,6 +503,12 @@ local_mount_root()
 		    # Handle mount failure for non-loop devices
 			panic "Failed to mount standard root device ${ROOT} (Type: ${FSTYPE}, error code = $mountroot_status)"
 		fi
+		
+		# FIXED: Add safe_sync for standard mounts too
+		if ! safe_sync 3 "standard root filesystem"; then
+		    log_warn "Standard root sync timed out, but continuing anyway"
+		fi
+		
 		log_end_msg 0
 	fi
 }

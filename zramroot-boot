@@ -6,7 +6,7 @@ CONFIG_FILE="/conf/zramroot-config"
 DEBUG_MODE="no" # Will be loaded from config
 REAL_ROOT_DEVICE="" # Will be set from ROOT environment variable
 REAL_ROOT_MNT="/mnt/real_root_rw"  # For persistent logging and copying
-DATE_TIME=$(date '+%m-%d-%H%M' 2>/dev/null || echo "unknown") # Generate log filename with date/time
+DATE_TIME=$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo "unknown") # Generate log filename with date/time
 REAL_ROOT_LOG_DIR="${REAL_ROOT_MNT}/var/log"
 REAL_ROOT_LOG_FILE="${REAL_ROOT_LOG_DIR}/zramroot-${DATE_TIME}.log"
 ZRAM_DEVICE="zram0"
@@ -16,7 +16,7 @@ ZRAM_DEVICE_NUM=0
 ZRAM_SIZE_MiB=0
 ZRAM_ALGO="lz4"
 ZRAM_FS_TYPE="ext4"
-ZRAM_MOUNT_OPTS="rw,noatime"
+ZRAM_MOUNT_OPTS="noatime"
 RAM_MIN_FREE_MiB=512   # Minimum RAM to leave free after ZRAM allocation
 ZRAM_MIN_FREE_MiB=256   # Minimum ZRAM to leave free for growth
 RAM_PREF_FREE_MiB=512  # Preferred RAM to leave free
@@ -25,6 +25,40 @@ ESTIMATED_COMPRESSION_RATIO=2.5
 ZRAM_BUFFER_PERCENT=10
 BOOT_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "unknown")
 ZRAM_TEMP_MNT="/tmp/zram_temp" # Use a temporary mount point in /tmp
+
+# --- Enhanced Logging Functions ---
+log_kernel() { 
+    echo "zramroot: $@" > /dev/kmsg 2>/dev/null || true
+}
+
+log_debug() {
+    if [ "${DEBUG_MODE}" = "yes" ]; then
+        log_kernel "DEBUG: $@"
+        # Also log to physical drive if mounted and writable
+        if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+            now=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+            echo "${now} ZRAMROOT-BOOT DEBUG: $@" >> "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+        fi
+    fi
+}
+
+log_error() {
+    log_kernel "ERROR: $@"
+    # Always log errors to physical drive if available
+    if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+        now=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+        echo "${now} ZRAMROOT-BOOT ERROR: $@" >> "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+    fi
+}
+
+log_info() {
+    log_kernel "$@"
+    # Log info messages to physical drive if debug mode is on
+    if [ "${DEBUG_MODE}" = "yes" ] && [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+        now=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+        echo "${now} ZRAMROOT-BOOT INFO: $@" >> "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+    fi
+}
 
 # --- Progress Bar Functions ---
 # Terminal control sequences
@@ -36,62 +70,63 @@ YELLOW="${ESC}[1;33m"
 BLUE="${ESC}[0;34m"
 NC="${ESC}[0m" # No Color
 
-# Function to draw progress bar
+# Function to draw progress bar - simplified to avoid duplicates
 draw_progress_bar() {
     local percentage=$1
-    local bar_width=40
+    local bar_width=50
     local filled=$((percentage * bar_width / 100))
     local empty=$((bar_width - filled))
     
-    # Create the bar
-    local bar_filled=""
-    local bar_empty=""
+    # Create the bar using a simpler approach
+    local bar=""
     local i=0
     
     # Fill the completed portion
     while [ $i -lt $filled ]; do
-        bar_filled="${bar_filled}█"
+        bar="${bar}█"
         i=$((i + 1))
     done
     
     # Add the empty portion
     i=0
     while [ $i -lt $empty ]; do
-        bar_empty="${bar_empty}░"
+        bar="${bar}░"
         i=$((i + 1))
     done
     
-    # Display the progress bar
-    printf "${CLEAR_LINE}${BLUE}[${GREEN}${bar_filled}${YELLOW}${bar_empty}${BLUE}] ${GREEN}%3d%%${NC} Copying to ZRAM..." "$percentage"
+    # Clear the line and display the progress bar - single line only
+    printf "\r${BLUE}[${GREEN}${bar}${BLUE}] ${GREEN}%3d%%${NC} Copying to ZRAM...     " "$percentage"
+    
+    # Log progress to physical drive if debug mode is on
+    if [ "${DEBUG_MODE}" = "yes" ] && [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown') PROGRESS: ${percentage}%" >> "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+    fi
 }
 
-# Function to copy with progress monitoring
+# Function to copy with progress monitoring based on destination size
 copy_with_progress() {
     local source="$1"
     local dest="$2"
+    local update_interval=2  # Update loading-bar every 2 seconds
+    
+    log_debug "Starting copy from ${source} to ${dest}"
     
     # Get total size to copy (in KB)
-    local total_kb=$(du -sk "$source" | awk '{print $1}')
-    log_debug "Total size to copy: ${total_kb} KB"
-    
-    # Create named pipe for rsync progress
-    local pipe="/tmp/rsync_progress.$"
-    mkfifo "$pipe" 2>/dev/null || {
-        log_error "Failed to create progress pipe"
+    log_debug "Calculating source directory size..."
+    local total_kb=$(du -sk "$source" 2>/dev/null | awk '{print $1}')
+    if [ -z "$total_kb" ] || [ "$total_kb" -eq 0 ]; then
+        log_error "Could not determine source directory size"
         return 1
-    }
+    fi
     
-    # Start rsync in background with progress
+    log_debug "Total size to copy: ${total_kb} KB ($(($total_kb / 1024)) MB)"
+    
+    # Start rsync in background
     RSYNC_EXCLUDE="--exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found --exclude=/var/log/journal/*"
     
-    # Use rsync with --info=progress2 for machine-readable progress
-    rsync -ax --delete --info=progress2 ${RSYNC_EXCLUDE} "${source}/" "${dest}/" > "$pipe" 2>&1 &
-    local rsync_pid=$!
+    log_debug "Starting rsync process..."
     
-    # Monitor progress
-    local last_percentage=0
-    
-    # Add several blank lines to push the progress bar up and make it more visible
+    # Clear screen area for progress bar and add header
     echo ""
     echo ""
     echo ""
@@ -100,57 +135,58 @@ copy_with_progress() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     
-    # Display initial progress bar at 0%
+    # Start the progress bar at 0%
     draw_progress_bar 0
     
+    # Start rsync in background and capture PID
+    rsync -ax --delete ${RSYNC_EXCLUDE} "${source}/" "${dest}/" &
+    local rsync_pid=$!
+    
+    log_debug "Rsync started with PID: ${rsync_pid}"
+    
+    # Monitor progress by checking destination size
+    local last_percentage=0
+    local start_time=$(date +%s)
+    
     while kill -0 $rsync_pid 2>/dev/null; do
-        if read line < "$pipe"; then
-            # Parse rsync progress output
-            # Look for lines with format: "1,234,567,890  45%  1.23MB/s  0:00:12"
-            if echo "$line" | grep -q "%"; then
-                # Extract percentage
-                local current_percentage=$(echo "$line" | grep -oE '[0-9]+%' | tr -d '%' | head -1)
-                
-                if [ -n "$current_percentage" ] && [ "$current_percentage" -ne "$last_percentage" ]; then
-                    # Move cursor up to overwrite the previous progress bar
-                    printf "${MOVE_UP}"
-                    draw_progress_bar "$current_percentage"
-                    last_percentage=$current_percentage
-                fi
+        # Get current size of destination (in KB)
+        local current_kb=$(du -sk "$dest" 2>/dev/null | awk '{print $1}')
+        
+        if [ -n "$current_kb" ] && [ "$current_kb" -gt 0 ]; then
+            # Calculate percentage based on copied data
+            local current_percentage=$(( (current_kb * 100) / total_kb ))
+            
+            # Cap at 99% until rsync is done
+            if [ "$current_percentage" -gt 99 ]; then
+                current_percentage=99
+            fi
+            
+            # Update progress bar if percentage changed
+            if [ "$current_percentage" -ne "$last_percentage" ]; then
+                draw_progress_bar "$current_percentage"
+                last_percentage=$current_percentage
+                log_debug "Progress: ${current_percentage}% (${current_kb}KB/${total_kb}KB)"
             fi
         fi
-        sleep 0.1
+        
+        # Wait before next check
+        sleep $update_interval
     done
     
     # Wait for rsync to complete and get exit status
     wait $rsync_pid
     local rsync_exit=$?
     
-    # Clean up pipe
-    rm -f "$pipe"
-    
-    # Final progress bar at 100%
-    printf "${MOVE_UP}"
+    # Show 100% completion
     draw_progress_bar 100
     echo ""  # New line after progress bar
     echo ""
     
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    log_debug "Copy completed in ${duration} seconds with exit code: ${rsync_exit}"
+    
     return $rsync_exit
-}
-
-# --- Logging Functions ---
-log_kernel() { 
-    echo "zramroot: $@" > /dev/kmsg 2>/dev/null || true
-}
-
-log_debug() {
-    if [ "${DEBUG_MODE}" = "yes" ]; then
-        log_kernel "DEBUG: $@"
-    fi
-}
-
-log_error() {
-    log_kernel "ERROR: $@"
 }
 
 # Check if zramroot parameter is in cmdline before doing anything
@@ -167,27 +203,44 @@ mkdir -p /mnt
 mkdir -p /tmp
 mkdir -p "${ZRAM_TEMP_MNT}"
 
-# Try to mount physical root for logging (don't fail if this doesn't work)
+# Try to mount physical root for logging and file copying
 REAL_ROOT_DEVICE="${ROOT}"
 if [ -n "${REAL_ROOT_DEVICE}" ]; then
-    log_debug "Attempting to mount physical root ${REAL_ROOT_DEVICE} for logging"
+    log_debug "Attempting to mount physical root ${REAL_ROOT_DEVICE} for logging and copying"
     mkdir -p "${REAL_ROOT_MNT}"
+    
+    # Wait a bit for device to be ready
+    sleep 2
     
     # Try to find the real device
     real_dev=""
-    if command -v blkid >/dev/null 2>&1; then
-        real_dev=$(blkid -l -t "${REAL_ROOT_DEVICE}" -o device 2>/dev/null)
-    fi
     
-    if [ -z "$real_dev" ] && [ "${REAL_ROOT_DEVICE#/dev/}" != "${REAL_ROOT_DEVICE}" ] && [ -b "${REAL_ROOT_DEVICE}" ]; then
+    # First try resolving UUID/LABEL style devices
+    if echo "${REAL_ROOT_DEVICE}" | grep -q "^UUID=\|^LABEL="; then
+        if command -v blkid >/dev/null 2>&1; then
+            real_dev=$(blkid -l -t "${REAL_ROOT_DEVICE}" -o device 2>/dev/null)
+            log_debug "Resolved ${REAL_ROOT_DEVICE} to ${real_dev}"
+        fi
+    # Handle direct device paths
+    elif [ "${REAL_ROOT_DEVICE#/dev/}" != "${REAL_ROOT_DEVICE}" ] && [ -b "${REAL_ROOT_DEVICE}" ]; then
         real_dev="${REAL_ROOT_DEVICE}"
+        log_debug "Using direct device path: ${real_dev}"
     fi
     
     if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
+        log_debug "Attempting to mount ${real_dev} at ${REAL_ROOT_MNT}"
         if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
+            # Ensure log directory exists
             mkdir -p "${REAL_ROOT_LOG_DIR}"
-            log_debug "Physical root mounted for logging at ${REAL_ROOT_MNT}"
+            # Create/touch the log file to ensure it's writable
+            touch "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+            log_debug "Physical root mounted successfully at ${REAL_ROOT_MNT}"
+            log_debug "Log file created at ${REAL_ROOT_LOG_FILE}"
+        else
+            log_error "Failed to mount physical root device ${real_dev}"
         fi
+    else
+        log_error "Could not find physical root device: ${REAL_ROOT_DEVICE}"
     fi
 fi
 
@@ -201,6 +254,7 @@ RAM_PREF_FREE_MiB=1024; ZRAM_MIN_FREE_MiB=256; ZRAM_MAX_FREE_MiB=35840
 if [ -f "${CONFIG_FILE}" ]; then
     log_debug "Loading configuration from ${CONFIG_FILE}"
     . "${CONFIG_FILE}"
+    log_debug "Configuration loaded - DEBUG_MODE=${DEBUG_MODE}"
 fi
 
 # Set algorithm-specific compression estimates based on empirical testing
@@ -227,7 +281,7 @@ log_debug "Using compression ratio estimate of ${ESTIMATED_COMPRESSION_RATIO} fo
 
 ZRAM_DEVICE="/dev/zram${ZRAM_DEVICE_NUM}"
 
-log_kernel "=== STARTING ZRAM ROOT SETUP PROCESS ==="
+log_info "=== STARTING ZRAM ROOT SETUP PROCESS ==="
 
 # Check available RAM
 AVAILABLE_RAM_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
@@ -257,7 +311,7 @@ else
     log_debug "Could not mount physical root, estimating 4GB"
 fi
 
-log_kernel "Used size on physical root: ${ROOT_USED_MiB} MiB"
+log_info "Used size on physical root: ${ROOT_USED_MiB} MiB"
 
 # Add buffer to root usage
 BUFFER_MiB=$(awk -v u="$ROOT_USED_MiB" -v p="$ZRAM_BUFFER_PERCENT" 'BEGIN{printf "%.0f", u * p / 100}')
@@ -266,12 +320,12 @@ ROOT_WITH_BUFFER_MiB=$((ROOT_USED_MiB + BUFFER_MiB))
 # Calculate expected compressed size using compression ratio
 # This is the key fix: we need to account for compression when sizing ZRAM
 EXPECTED_COMPRESSED_ROOT_MiB=$(awk -v r="$ROOT_WITH_BUFFER_MiB" -v c="$ESTIMATED_COMPRESSION_RATIO" 'BEGIN{printf "%.0f", r / c}')
-log_kernel "Expected compressed size: ${EXPECTED_COMPRESSED_ROOT_MiB} MiB (ratio: ${ESTIMATED_COMPRESSION_RATIO})"
+log_info "Expected compressed size: ${EXPECTED_COMPRESSED_ROOT_MiB} MiB (ratio: ${ESTIMATED_COMPRESSION_RATIO})"
 
 # Determine ZRAM size
 if [ "$ZRAM_SIZE_MiB" -gt 0 ]; then
     FINAL_ZRAM_SIZE_MiB=$ZRAM_SIZE_MiB
-    log_kernel "Using configured ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+    log_info "Using configured ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
 else
     # Calculate dynamically based on compressed size
     if [ $((AVAILABLE_RAM_MiB - RAM_MIN_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB - ZRAM_MIN_FREE_MiB)) -le 0 ]; then
@@ -281,21 +335,21 @@ else
     
     if [ $((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB - ZRAM_MIN_FREE_MiB)) -le 0 ]; then
         FINAL_ZRAM_SIZE_MiB=$((EXPECTED_COMPRESSED_ROOT_MiB + ZRAM_MIN_FREE_MiB))
-        log_kernel "RAM is tight: Using minimum ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+        log_info "RAM is tight: Using minimum ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
     elif [ $((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB - ZRAM_MAX_FREE_MiB)) -le 0 ]; then
         EXTRA_ZRAM=$((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB))
         FINAL_ZRAM_SIZE_MiB=$((EXPECTED_COMPRESSED_ROOT_MiB + EXTRA_ZRAM))
-        log_kernel "Medium RAM availability: Using ${FINAL_ZRAM_SIZE_MiB} MiB for ZRAM"
+        log_info "Medium RAM availability: Using ${FINAL_ZRAM_SIZE_MiB} MiB for ZRAM"
     else
         FINAL_ZRAM_SIZE_MiB=$((EXPECTED_COMPRESSED_ROOT_MiB + ZRAM_MAX_FREE_MiB))
-        log_kernel "Plenty of RAM: Using maximum ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+        log_info "Plenty of RAM: Using maximum ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
     fi
     
     # Additional safety check: ensure ZRAM size is reasonable
     # ZRAM size should be at least the compressed size or we risk running out of space
     MIN_SAFE_ZRAM=$((EXPECTED_COMPRESSED_ROOT_MiB + (EXPECTED_COMPRESSED_ROOT_MiB / 4)))  # Add 25% safety margin
     if [ "$FINAL_ZRAM_SIZE_MiB" -lt "$MIN_SAFE_ZRAM" ]; then
-        log_kernel "Adjusting ZRAM size to safe minimum: ${MIN_SAFE_ZRAM} MiB (was ${FINAL_ZRAM_SIZE_MiB} MiB)"
+        log_info "Adjusting ZRAM size to safe minimum: ${MIN_SAFE_ZRAM} MiB (was ${FINAL_ZRAM_SIZE_MiB} MiB)"
         FINAL_ZRAM_SIZE_MiB=$MIN_SAFE_ZRAM
     fi
 fi
@@ -361,7 +415,7 @@ fi
 log_debug "ZRAM device configured successfully"
 
 # Format ZRAM filesystem
-log_kernel "Formatting ZRAM device with ${ZRAM_FS_TYPE} filesystem..."
+log_info "Formatting ZRAM device with ${ZRAM_FS_TYPE} filesystem..."
 mkfs_cmd="mkfs.${ZRAM_FS_TYPE}"
 mkfs_opts=""
 
@@ -378,7 +432,7 @@ elif [ "$ZRAM_FS_TYPE" = "btrfs" ]; then
 fi
 
 if ${mkfs_cmd} ${mkfs_opts} "${ZRAM_DEVICE}" >/dev/null 2>&1; then
-    log_kernel "ZRAM device formatted successfully"
+    log_info "ZRAM device formatted successfully"
 else
     log_error "Failed to format ZRAM device!"
     exit 1
@@ -391,11 +445,11 @@ if mount -t "${ZRAM_FS_TYPE}" -o "rw,${ZRAM_MOUNT_OPTS}" "${ZRAM_DEVICE}" "${ZRA
     
     # Copy filesystem from physical root to ZRAM ONLY if we successfully mounted physical root
     if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
-        log_kernel "Copying root filesystem from ${REAL_ROOT_MNT} to ZRAM..."
+        log_info "Copying root filesystem from ${REAL_ROOT_MNT} to ZRAM..."
         
         # Use the copy function with progress bar
         if copy_with_progress "${REAL_ROOT_MNT}" "${ZRAM_TEMP_MNT}"; then
-            log_kernel "Filesystem copy completed successfully"
+            log_info "Filesystem copy completed successfully"
             
             # Create required directories in ZRAM root
             for dir in dev proc sys run tmp; do
@@ -409,7 +463,7 @@ if mount -t "${ZRAM_FS_TYPE}" -o "rw,${ZRAM_MOUNT_OPTS}" "${ZRAM_DEVICE}" "${ZRA
                 cp "${ZRAM_TEMP_MNT}/etc/fstab" "${ZRAM_TEMP_MNT}/etc/fstab.zram_backup"
                 
                 # Create a temporary file for sed operations to avoid in-place editing issues
-                temp_fstab="/tmp/fstab_temp.$"
+                temp_fstab="/tmp/fstab_temp.$$"
                 
                 # Comment out root filesystem entry
                 sed 's|^\([^#].*[[:space:]]/[[:space:]].*\)$|# ZRAMROOT: \1|g' "${ZRAM_TEMP_MNT}/etc/fstab" > "$temp_fstab"
@@ -429,7 +483,7 @@ if mount -t "${ZRAM_FS_TYPE}" -o "rw,${ZRAM_MOUNT_OPTS}" "${ZRAM_DEVICE}" "${ZRA
                 log_debug "Successfully modified /etc/fstab"
             fi
         else
-            log_error "Rsync failed to copy files from physical root to ZRAM!"
+            log_error "Failed to copy files from physical root to ZRAM!"
             exit 1
         fi
     else
@@ -454,7 +508,7 @@ final_mount_opts=$(echo "${ZRAM_MOUNT_OPTS},rw" | sed 's/,defaults//g; s/,ro//g;
 [ -z "$final_mount_opts" ] && final_mount_opts="rw"
 
 # Export ZRAM variables for use by the local script
-log_kernel "Setting ZRAMROOT Variables..."
+log_info "Setting ZRAMROOT Variables..."
 export ZRAMROOT_DEVICE="${ZRAM_DEVICE}"
 export ZRAMROOT_FSTYPE="${ZRAM_FS_TYPE}"
 export ZRAMROOT_ROOTFLAGS="${final_mount_opts}"
@@ -470,9 +524,12 @@ echo "ZRAMROOT_DEVICE=${ZRAM_DEVICE}" > /tmp/zramroot_vars
 echo "ZRAMROOT_FSTYPE=${ZRAM_FS_TYPE}" >> /tmp/zramroot_vars
 echo "ZRAMROOT_ROOTFLAGS=${final_mount_opts}" >> /tmp/zramroot_vars
 
-log_kernel "ZRAMROOT_DEVICE=${ZRAM_DEVICE}"
-log_kernel "ZRAMROOT_FSTYPE=${ZRAM_FS_TYPE}"
-log_kernel "ZRAMROOT_ROOTFLAGS=${final_mount_opts}"
+log_info "ZRAMROOT_DEVICE=${ZRAM_DEVICE}"
+log_info "ZRAMROOT_FSTYPE=${ZRAM_FS_TYPE}"
+log_info "ZRAMROOT_ROOTFLAGS=${final_mount_opts}"
+
+# Final log entry
+log_info "===== ZRAM ROOT PREPARATION SCRIPT FINISHED SUCCESSFULLY ====="
 
 # Cleanup physical root mount if we mounted it
 if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
@@ -481,5 +538,4 @@ if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
     umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
 fi
 
-log_kernel "===== ZRAM ROOT PREPARATION SCRIPT FINISHED SUCCESSFULLY ====="
 exit 0
