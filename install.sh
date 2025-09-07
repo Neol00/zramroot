@@ -345,32 +345,32 @@ fi
 case "$distro_id" in
     "ubuntu")
         grub_class="ubuntu"
-        additional_modules="insmod part_gpt; insmod ext2"
+        additional_modules="\tinsmod part_gpt\n\tinsmod ext2"
         ;;
     "debian")
         grub_class="debian"
-        additional_modules="insmod part_gpt; insmod ext2"
+        additional_modules="\tinsmod part_gpt\n\tinsmod ext2"
         ;;
     "fedora")
         grub_class="fedora"
-        additional_modules="insmod part_gpt; insmod ext2; insmod xfs"
+        additional_modules="\tinsmod part_gpt\n\tinsmod ext2\n\tinsmod xfs"
         ;;
     "centos"|"rhel")
         grub_class="centos"
-        additional_modules="insmod part_gpt; insmod ext2; insmod xfs"
+        additional_modules="\tinsmod part_gpt\n\tinsmod ext2\n\tinsmod xfs"
         ;;
     "arch"|"manjaro")
         grub_class="arch"
-        additional_modules="insmod part_gpt; insmod ext2"
+        additional_modules="\tinsmod part_gpt\n\tinsmod ext2"
         ;;
     "opensuse"|"suse")
         grub_class="opensuse"
-        additional_modules="insmod part_gpt; insmod ext2; insmod btrfs; insmod xfs"
+        additional_modules="\tinsmod part_gpt\n\tinsmod ext2\n\tinsmod btrfs\n\tinsmod xfs"
         ;;
     *)
         # Generic Linux fallback
         grub_class="gnu-linux"
-        additional_modules="insmod part_gpt; insmod ext2"
+        additional_modules="\tinsmod part_gpt\n\tinsmod ext2"
         if [ -z "$distro_name" ]; then
             distro_name="Linux"
         fi
@@ -535,7 +535,13 @@ menuentry '${os_name} (Load Root to ZRAM)' --class ${grub_class} --class gnu-lin
 	gfxmode \$linux_gfx_mode
 	insmod gzio
 	if [ x\$grub_platform = xxen ]; then insmod xzio; insmod lzopio; fi
-	${additional_modules}
+EOF
+
+# Add the additional modules with proper formatting
+echo -e "$additional_modules" >> "$grub_custom_file"
+
+# Continue with the rest of the entry
+cat >> "$grub_custom_file" << EOF
 	search --no-floppy --fs-uuid --set=root ${root_uuid}
 	linux	${kernel_path} ${final_kernel_params}
 	initrd	${initrd_path}
