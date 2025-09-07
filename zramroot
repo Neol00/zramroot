@@ -237,7 +237,7 @@ case "${ZRAM_ALGO}" in
 esac
 
 # Add extra modules
-EXTRA_MODULES="efi_pstore dmi_sysfs socinfo arm_smccc_trng reboot_mode fixed gpio_keys input_leds joydev uio uio_pdrv_genirq ocmem qcom_common qcom_q6v5 qcom_q6v5_pas qcom_pil_info qcom_spmi_pmic qcom_spmi_temp_alarm qcom_stats qcom_edac qcom_pon pm8941_pwrkey rtc_pm8xxx pwrseq_core pwrseq_qcom_wcn qrtr qrtr_mhi icc_bwmon btrfs blake2b_generic xor xor_neon raid6_pq autofs4 nvme_core nvme nvme_auth nf_defrag_ipv4 nf_defrag_ipv6 nf_conntrack nf_nat nfnetlink x_tables nft_ct nft_reject nf_reject_ipv4 nf_reject_ipv6 nft_reject_inet nft_chain_nat sch_fq_codel ip_set aes_ce_cipher aes_ce_blk aes_ce_ccm sha3_ce sm3_ce sm4 sm4_ce sm4_ce_cipher sm4_ce_ccm sm4_ce_gcm ghash_ce polyval_generic polyval_ce michael_mic af_alg algif_skcipher algif_hash libarc4 typec_ucsi i2c_qcom_geni i2c_hid i2c_hid_of hid hid_generic hid_multitouch snd snd_timer snd_pcm snd_seq_device snd_seq snd_soc_core soundcore industrialio snd_soc_lpass_macro_common snd_soc_lpass_rx_macro snd_soc_lpass_tx_macro snd_soc_lpass_wsa_macro snd_soc_lpass_va_macro snd_soc_hdmi_codec lpasscc_sc8280xp pinctrl_lpass_lpi drm_exec gpu_sched msm pci_pwrctrl_core pci_pwrctrl_pwrseq phy_qcom_edp phy_nxp_ptn3222 ps883x tcsrcc_x1e80100 gpucc_x1e80100 dispcc_x1e80100 panel_samsung_atna33xc20 libcurve25519_generic libchacha libchacha20poly1305 chacha_neon poly1305_neon"
+EXTRA_MODULES=""
 
 log_hook "Adding Extra modules: ${EXTRA_MODULES}"
 for module in ${EXTRA_MODULES}; do
