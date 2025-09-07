@@ -112,7 +112,7 @@ while [ "$module_selection_complete" = false ]; do
     
     # Check each module
     for module in $additional_modules; do
-        if modinfo $module &>/dev/null || [ -f "/lib/modules/6.17.0-rc3/kernel/$module.ko" ] || find /lib/modules/6.17.0-rc3 -name "${module}.ko*" | grep -q .; then
+        if modinfo $module &>/dev/null || [ -f "/lib/modules/$(uname -r)/kernel/$module.ko" ] || find /lib/modules/$(uname -r) -name "${module}.ko*" | grep -q .; then
             existing_modules+=("$module")
             print_info "Module '$module' exists in the system."
         else
