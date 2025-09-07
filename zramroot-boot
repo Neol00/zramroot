@@ -531,11 +531,73 @@ log_info "ZRAMROOT_ROOTFLAGS=${final_mount_opts}"
 # Final log entry
 log_info "===== ZRAM ROOT PREPARATION SCRIPT FINISHED SUCCESSFULLY ====="
 
+# --- LVM2 Cleanup Function ---
+cleanup_lvm2() {
+    # Check if LVM2 support is available
+    if [ -f "/conf/lvm_support" ]; then
+        . /conf/lvm_support
+        if [ "${LVM_SUPPORT}" = "yes" ]; then
+            log_info "Attempting to deactivate LVM2 volumes..."
+            
+            # Get the root device info to determine which VG to deactivate
+            local root_dev="${REAL_ROOT_DEVICE}"
+            local vg_name=""
+            
+            # Try to extract VG name from device path
+            if echo "${root_dev}" | grep -q "/dev/mapper/"; then
+                # Extract VG name from mapper path like /dev/mapper/vg0-root
+                vg_name=$(echo "${root_dev}" | sed 's|/dev/mapper/\([^-]*\)-.*|\1|')
+            elif echo "${root_dev}" | grep -q "/dev/.*/"; then
+                # Extract VG name from LVM path like /dev/vg0/root
+                vg_name=$(echo "${root_dev}" | sed 's|/dev/\([^/]*\)/.*|\1|')
+            fi
+            
+            if [ -n "${vg_name}" ]; then
+                log_debug "Detected volume group: ${vg_name}"
+                
+                # First try to deactivate the specific logical volume
+                if command -v lvchange >/dev/null 2>&1; then
+                    log_debug "Deactivating logical volume: ${root_dev}"
+                    lvchange -an "${root_dev}" 2>/dev/null || true
+                fi
+                
+                # Then try to deactivate the entire volume group
+                if command -v vgchange >/dev/null 2>&1; then
+                    log_debug "Deactivating volume group: ${vg_name}"
+                    vgchange -an "${vg_name}" 2>/dev/null || true
+                fi
+                
+                # Give it a moment to complete
+                sleep 2
+                
+                log_info "LVM2 volume group '${vg_name}' deactivated"
+            else
+                log_debug "Could not determine volume group name from ${root_dev}"
+                
+                # Fallback: try to deactivate all volume groups
+                if command -v vgchange >/dev/null 2>&1; then
+                    log_debug "Attempting to deactivate all volume groups"
+                    vgchange -an 2>/dev/null || true
+                    sleep 2
+                    log_info "All LVM2 volumes deactivated"
+                fi
+            fi
+        else
+            log_debug "LVM2 support not available - skipping LVM2 cleanup"
+        fi
+    else
+        log_debug "No LVM2 support configuration found - skipping LVM2 cleanup"
+    fi
+}
+
 # Cleanup physical root mount if we mounted it
 if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
     log_debug "Unmounting physical root"
     sync
     umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
+    
+    # After unmounting, try to deactivate LVM2 volumes
+    cleanup_lvm2
 fi
 
 exit 0
