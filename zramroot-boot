@@ -165,11 +165,10 @@ create_work_distribution() {
     
     # Distribute directories across job files using round-robin with load balancing
     local job_index=0
-    local -a job_sizes
     
-    # Initialize job size trackers
+    # Initialize job size trackers and job lists
     for i in $(seq 0 $((thread_count - 1))); do
-        job_sizes[i]=0
+        echo "0" > "${work_dir}/job_${i}.size"
         touch "${work_dir}/job_${i}.list"
     done
     
@@ -181,17 +180,19 @@ create_work_distribution() {
             
             # Find job with minimum current size
             local min_job=0
-            local min_size=${job_sizes[0]}
+            local min_size=$(cat "${work_dir}/job_0.size")
             for i in $(seq 1 $((thread_count - 1))); do
-                if [ "${job_sizes[i]}" -lt "$min_size" ]; then
-                    min_size=${job_sizes[i]}
+                local current_size=$(cat "${work_dir}/job_${i}.size")
+                if [ "$current_size" -lt "$min_size" ]; then
+                    min_size=$current_size
                     min_job=$i
                 fi
             done
             
             # Add directory to the job with minimum size
             echo "$dir_name" >> "${work_dir}/job_${min_job}.list"
-            job_sizes[min_job]=$((job_sizes[min_job] + size))
+            local new_size=$((min_size + size))
+            echo "$new_size" > "${work_dir}/job_${min_job}.size"
             
             log_debug "Assigned ${dir_name} (${size}KB) to job ${min_job}"
         fi
@@ -202,7 +203,8 @@ create_work_distribution() {
     
     # Log job distribution
     for i in $(seq 0 $((thread_count - 1))); do
-        local job_size_mb=$((job_sizes[i] / 1024))
+        local job_size_kb=$(cat "${work_dir}/job_${i}.size")
+        local job_size_mb=$((job_size_kb / 1024))
         local dir_count=$(wc -l < "${work_dir}/job_${i}.list")
         log_debug "Job ${i}: ${dir_count} items, ~${job_size_mb}MB"
     done
@@ -251,7 +253,6 @@ copy_with_parallel_progress() {
     draw_parallel_progress_bar 0 "$thread_count"
     
     # Start all rsync jobs in parallel
-    local -a job_pids
     local start_time=$(date +%s)
     
     for i in $(seq 0 $((thread_count - 1))); do
@@ -264,20 +265,24 @@ copy_with_parallel_progress() {
                 # Process each directory/file in this job
                 while read item; do
                     if [ "$item" = "ROOT_FILES" ]; then
-                        # Copy root level files
-                        rsync -ax --delete ${RSYNC_EXCLUDE} \
+                        # Copy root level files and symlinks (excluding directories that are handled separately)
+                        rsync -ax \
                               --include="/*" --exclude="/*/" \
+                              --exclude="/dev" --exclude="/proc" --exclude="/sys" --exclude="/tmp" \
+                              --exclude="/run" --exclude="/mnt" --exclude="/media" --exclude="/lost+found" \
                               "${source}/" "${dest}/" 2>>"$job_log"
                     else
                         # Copy specific directory
+                        mkdir -p "${dest}/${item}"
                         rsync -ax --delete \
                               "${source}/${item}/" "${dest}/${item}/" 2>>"$job_log"
                     fi
                 done < "$job_file"
             ) &
             
-            job_pids[i]=$!
-            log_debug "Started rsync job ${i} with PID ${job_pids[i]}"
+            local job_pid=$!
+            echo "$job_pid" > "${work_dir}/job_${i}.pid"
+            log_debug "Started rsync job ${i} with PID ${job_pid}"
         fi
     done
     
@@ -291,8 +296,12 @@ copy_with_parallel_progress() {
         
         # Check if any jobs are still running
         for i in $(seq 0 $((thread_count - 1))); do
-            if [ -n "${job_pids[i]}" ] && kill -0 "${job_pids[i]}" 2>/dev/null; then
-                running_jobs=$((running_jobs + 1))
+            local pid_file="${work_dir}/job_${i}.pid"
+            if [ -f "$pid_file" ]; then
+                local job_pid=$(cat "$pid_file")
+                if [ -n "$job_pid" ] && kill -0 "$job_pid" 2>/dev/null; then
+                    running_jobs=$((running_jobs + 1))
+                fi
             fi
         done
         
@@ -326,12 +335,16 @@ copy_with_parallel_progress() {
     # Wait for all remaining jobs and collect exit codes
     local overall_exit=0
     for i in $(seq 0 $((thread_count - 1))); do
-        if [ -n "${job_pids[i]}" ]; then
-            wait "${job_pids[i]}"
-            local job_exit=$?
-            if [ $job_exit -ne 0 ]; then
-                log_debug "Job ${i} exited with code ${job_exit}"
-                overall_exit=$job_exit
+        local pid_file="${work_dir}/job_${i}.pid"
+        if [ -f "$pid_file" ]; then
+            local job_pid=$(cat "$pid_file")
+            if [ -n "$job_pid" ]; then
+                wait "$job_pid"
+                local job_exit=$?
+                if [ $job_exit -ne 0 ]; then
+                    log_debug "Job ${i} exited with code ${job_exit}"
+                    overall_exit=$job_exit
+                fi
             fi
         fi
     done
