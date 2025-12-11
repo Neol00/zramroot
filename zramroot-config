@@ -35,6 +35,22 @@ ZRAM_MAX_FREE_MiB=35840
 # Buffer percentage to add to the original used size when calculating ZRAM size automatically.
 ZRAM_BUFFER_PERCENT=10
 
+# --- ZRAM Swap Settings ---
+# Enable ZRAM-based swap to replace original drive swap partitions
+ZRAM_SWAP_ENABLED="yes"
+
+# ZRAM swap device number (usually 1, since 0 is used for root)
+ZRAM_SWAP_DEVICE_NUM=1
+
+# ZRAM swap size in MiB (0 = auto-calculate based on system RAM)
+ZRAM_SWAP_SIZE_MiB=0
+
+# ZRAM swap compression algorithm (should match or be compatible with root ZRAM)
+ZRAM_SWAP_ALGO="lz4"
+
+# Priority for ZRAM swap (higher numbers = higher priority, default swap is usually 0)
+ZRAM_SWAP_PRIORITY=10
+
 # --- Advanced (Usually leave as default) ---
 # ZRAM Device Number (usually 0)
 ZRAM_DEVICE_NUM=0

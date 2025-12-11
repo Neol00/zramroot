@@ -103,16 +103,127 @@ draw_progress_bar() {
     fi
 }
 
-# Function to copy with progress monitoring based on destination size
-copy_with_progress() {
+# Function to detect optimal number of parallel operations
+detect_optimal_threads() {
+    local cpu_cores=$(nproc 2>/dev/null || echo "1")
+    local available_ram_mb=$(($(grep MemAvailable /proc/meminfo | awk '{print $2}') / 1024))
+    
+    # Start with CPU core count
+    local optimal_threads=$cpu_cores
+    
+    # Adjust based on available RAM (each rsync process uses ~50-100MB)
+    local max_ram_threads=$((available_ram_mb / 75))  # Conservative estimate
+    if [ "$max_ram_threads" -lt "$optimal_threads" ]; then
+        optimal_threads=$max_ram_threads
+    fi
+    
+    # Ensure we have at least 1 thread and no more than 16 (diminishing returns)
+    if [ "$optimal_threads" -lt 1 ]; then
+        optimal_threads=1
+    elif [ "$optimal_threads" -gt 16 ]; then
+        optimal_threads=16
+    fi
+    
+    log_debug "Detected ${cpu_cores} CPU cores, ${available_ram_mb}MB RAM"
+    log_debug "Using ${optimal_threads} parallel rsync operations"
+    
+    echo "$optimal_threads"
+}
+
+# Function to analyze directory structure and create work distribution
+create_work_distribution() {
+    local source="$1"
+    local thread_count="$2"
+    local work_dir="/tmp/parallel_rsync_work"
+    
+    log_debug "Creating work distribution for ${thread_count} threads"
+    
+    # Create temporary directory for work files
+    mkdir -p "$work_dir"
+    rm -f "${work_dir}/job_"*
+    
+    # Get top-level directories and their sizes
+    log_debug "Analyzing directory structure..."
+    
+    # Create list of directories with sizes (in KB)
+    local dir_list="${work_dir}/directories.list"
+    
+    # Get subdirectories of source, excluding special directories
+    find "$source" -maxdepth 1 -type d ! -path "$source" \
+        ! -name "dev" ! -name "proc" ! -name "sys" ! -name "tmp" \
+        ! -name "run" ! -name "mnt" ! -name "media" ! -name "lost+found" \
+        2>/dev/null | while read dir; do
+        if [ -d "$dir" ]; then
+            local size_kb=$(du -sk "$dir" 2>/dev/null | awk '{print $1}' || echo "0")
+            local dir_name=$(basename "$dir")
+            echo "${size_kb}:${dir_name}" >> "$dir_list"
+        fi
+    done
+    
+    # Sort directories by size (largest first) for better load balancing
+    sort -rn -t: -k1 "$dir_list" > "${dir_list}.sorted"
+    
+    # Distribute directories across job files using round-robin with load balancing
+    local job_index=0
+    local -a job_sizes
+    
+    # Initialize job size trackers
+    for i in $(seq 0 $((thread_count - 1))); do
+        job_sizes[i]=0
+        touch "${work_dir}/job_${i}.list"
+    done
+    
+    # Distribute directories to jobs, always picking the job with least total size
+    while read line; do
+        if [ -n "$line" ]; then
+            local size=$(echo "$line" | cut -d: -f1)
+            local dir_name=$(echo "$line" | cut -d: -f2)
+            
+            # Find job with minimum current size
+            local min_job=0
+            local min_size=${job_sizes[0]}
+            for i in $(seq 1 $((thread_count - 1))); do
+                if [ "${job_sizes[i]}" -lt "$min_size" ]; then
+                    min_size=${job_sizes[i]}
+                    min_job=$i
+                fi
+            done
+            
+            # Add directory to the job with minimum size
+            echo "$dir_name" >> "${work_dir}/job_${min_job}.list"
+            job_sizes[min_job]=$((job_sizes[min_job] + size))
+            
+            log_debug "Assigned ${dir_name} (${size}KB) to job ${min_job}"
+        fi
+    done < "${dir_list}.sorted"
+    
+    # Add any remaining files in root directory to job 0
+    echo "ROOT_FILES" >> "${work_dir}/job_0.list"
+    
+    # Log job distribution
+    for i in $(seq 0 $((thread_count - 1))); do
+        local job_size_mb=$((job_sizes[i] / 1024))
+        local dir_count=$(wc -l < "${work_dir}/job_${i}.list")
+        log_debug "Job ${i}: ${dir_count} items, ~${job_size_mb}MB"
+    done
+    
+    echo "$work_dir"
+}
+
+# Function for parallel rsync with progress monitoring
+copy_with_parallel_progress() {
     local source="$1"
     local dest="$2"
-    local update_interval=2  # Update loading-bar every 2 seconds
+    local update_interval=2
     
-    log_debug "Starting copy from ${source} to ${dest}"
+    log_debug "Starting parallel copy from ${source} to ${dest}"
+    
+    # Detect optimal thread count
+    local thread_count=$(detect_optimal_threads)
+    log_info "Using ${thread_count} parallel operations for maximum speed"
     
     # Get total size to copy (in KB)
-    log_debug "Calculating source directory size..."
+    log_debug "Calculating total source size..."
     local total_kb=$(du -sk "$source" 2>/dev/null | awk '{print $1}')
     if [ -z "$total_kb" ] || [ "$total_kb" -eq 0 ]; then
         log_error "Could not determine source directory size"
@@ -121,72 +232,240 @@ copy_with_progress() {
     
     log_debug "Total size to copy: ${total_kb} KB ($(($total_kb / 1024)) MB)"
     
-    # Start rsync in background
-    RSYNC_EXCLUDE="--exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found --exclude=/var/log/journal/*"
+    # Create work distribution
+    local work_dir=$(create_work_distribution "$source" "$thread_count")
     
-    log_debug "Starting rsync process..."
+    # Common rsync options
+    local RSYNC_EXCLUDE="--exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found --exclude=/var/log/journal/*"
     
-    # Clear screen area for progress bar and add header
+    # Display header
     echo ""
     echo ""
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "                        Copying filesystem to ZRAM"
+    echo "            Copying filesystem to ZRAM (${thread_count} parallel operations)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     
     # Start the progress bar at 0%
-    draw_progress_bar 0
+    draw_parallel_progress_bar 0 "$thread_count"
     
-    # Start rsync in background and capture PID
-    rsync -ax --delete ${RSYNC_EXCLUDE} "${source}/" "${dest}/" &
-    local rsync_pid=$!
-    
-    log_debug "Rsync started with PID: ${rsync_pid}"
-    
-    # Monitor progress by checking destination size
-    local last_percentage=0
+    # Start all rsync jobs in parallel
+    local -a job_pids
     local start_time=$(date +%s)
     
-    while kill -0 $rsync_pid 2>/dev/null; do
-        # Get current size of destination (in KB)
+    for i in $(seq 0 $((thread_count - 1))); do
+        local job_file="${work_dir}/job_${i}.list"
+        local job_log="${work_dir}/job_${i}.log"
+        
+        if [ -s "$job_file" ]; then
+            # Start rsync job in background
+            (
+                # Process each directory/file in this job
+                while read item; do
+                    if [ "$item" = "ROOT_FILES" ]; then
+                        # Copy root level files
+                        rsync -ax --delete ${RSYNC_EXCLUDE} \
+                              --include="/*" --exclude="/*/" \
+                              "${source}/" "${dest}/" 2>>"$job_log"
+                    else
+                        # Copy specific directory
+                        rsync -ax --delete \
+                              "${source}/${item}/" "${dest}/${item}/" 2>>"$job_log"
+                    fi
+                done < "$job_file"
+            ) &
+            
+            job_pids[i]=$!
+            log_debug "Started rsync job ${i} with PID ${job_pids[i]}"
+        fi
+    done
+    
+    # Monitor progress across all jobs
+    local last_percentage=0
+    local max_wait=1800  # 30 minute timeout
+    local elapsed=0
+    
+    while [ $elapsed -lt $max_wait ]; do
+        local running_jobs=0
+        
+        # Check if any jobs are still running
+        for i in $(seq 0 $((thread_count - 1))); do
+            if [ -n "${job_pids[i]}" ] && kill -0 "${job_pids[i]}" 2>/dev/null; then
+                running_jobs=$((running_jobs + 1))
+            fi
+        done
+        
+        if [ $running_jobs -eq 0 ]; then
+            break
+        fi
+        
+        # Calculate progress based on destination size
         local current_kb=$(du -sk "$dest" 2>/dev/null | awk '{print $1}')
         
         if [ -n "$current_kb" ] && [ "$current_kb" -gt 0 ]; then
-            # Calculate percentage based on copied data
             local current_percentage=$(( (current_kb * 100) / total_kb ))
             
-            # Cap at 99% until rsync is done
-            if [ "$current_percentage" -gt 99 ]; then
+            # Cap at 99% until all jobs are done
+            if [ "$current_percentage" -gt 99 ] && [ $running_jobs -gt 0 ]; then
                 current_percentage=99
             fi
             
             # Update progress bar if percentage changed
             if [ "$current_percentage" -ne "$last_percentage" ]; then
-                draw_progress_bar "$current_percentage"
+                draw_parallel_progress_bar "$current_percentage" "$thread_count" "$running_jobs"
                 last_percentage=$current_percentage
-                log_debug "Progress: ${current_percentage}% (${current_kb}KB/${total_kb}KB)"
+                log_debug "Progress: ${current_percentage}% (${current_kb}KB/${total_kb}KB, ${running_jobs} jobs active)"
             fi
         fi
         
-        # Wait before next check
         sleep $update_interval
+        elapsed=$((elapsed + update_interval))
     done
     
-    # Wait for rsync to complete and get exit status
-    wait $rsync_pid
-    local rsync_exit=$?
+    # Wait for all remaining jobs and collect exit codes
+    local overall_exit=0
+    for i in $(seq 0 $((thread_count - 1))); do
+        if [ -n "${job_pids[i]}" ]; then
+            wait "${job_pids[i]}"
+            local job_exit=$?
+            if [ $job_exit -ne 0 ]; then
+                log_debug "Job ${i} exited with code ${job_exit}"
+                overall_exit=$job_exit
+            fi
+        fi
+    done
     
     # Show 100% completion
-    draw_progress_bar 100
-    echo ""  # New line after progress bar
+    draw_parallel_progress_bar 100 "$thread_count" 0
+    echo ""
     echo ""
     
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
-    log_debug "Copy completed in ${duration} seconds with exit code: ${rsync_exit}"
+    local speed_mb_s=$(awk "BEGIN {printf \"%.1f\", ($total_kb/1024)/$duration}")
     
-    return $rsync_exit
+    log_info "Parallel copy completed in ${duration} seconds (${speed_mb_s} MB/s)"
+    
+    # Cleanup work files
+    rm -rf "$work_dir"
+    
+    return $overall_exit
+}
+
+# Enhanced progress bar for parallel operations
+draw_parallel_progress_bar() {
+    local percentage=$1
+    local total_threads=$2
+    local active_threads=${3:-$total_threads}
+    local bar_width=50
+    local filled=$((percentage * bar_width / 100))
+    local empty=$((bar_width - filled))
+    
+    # Create the bar
+    local bar=""
+    local i=0
+    
+    # Fill the completed portion
+    while [ $i -lt $filled ]; do
+        bar="${bar}█"
+        i=$((i + 1))
+    done
+    
+    # Add the empty portion
+    i=0
+    while [ $i -lt $empty ]; do
+        bar="${bar}░"
+        i=$((i + 1))
+    done
+    
+    # Clear line and display enhanced progress bar
+    printf "\r${BLUE}[${GREEN}${bar}${BLUE}] ${GREEN}%3d%%${NC} ${YELLOW}[${active_threads}/${total_threads} threads]${NC} Copying...     " "$percentage"
+    
+    # Log progress to physical drive if debug mode is on
+    if [ "${DEBUG_MODE}" = "yes" ] && [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown') PARALLEL-PROGRESS: ${percentage}% [${active_threads}/${total_threads} threads]" >> "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+    fi
+}
+
+# Wrapper function that maintains compatibility but uses parallel implementation
+copy_with_progress() {
+    copy_with_parallel_progress "$@"
+}
+
+# Function to setup ZRAM swap
+setup_zram_swap() {
+    log_debug "Setting up ZRAM swap device ${ZRAM_SWAP_DEVICE_NUM}"
+    
+    # Calculate ZRAM swap size if not specified
+    local swap_size_mib="${ZRAM_SWAP_SIZE_MiB}"
+    if [ "$swap_size_mib" -eq 0 ]; then
+        # Auto-calculate: typically 25-50% of RAM, but consider available space
+        local total_ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        local total_ram_mib=$((total_ram_kb / 1024))
+        
+        # Use 25% of total RAM for swap, but cap at 4GB
+        swap_size_mib=$((total_ram_mib / 4))
+        if [ "$swap_size_mib" -gt 4096 ]; then
+            swap_size_mib=4096
+        fi
+        
+        # Ensure minimum 512MB swap
+        if [ "$swap_size_mib" -lt 512 ]; then
+            swap_size_mib=512
+        fi
+        
+        log_debug "Auto-calculated ZRAM swap size: ${swap_size_mib} MiB (based on ${total_ram_mib} MiB total RAM)"
+    fi
+    
+    local zram_swap_device="/dev/zram${ZRAM_SWAP_DEVICE_NUM}"
+    
+    # Configure ZRAM swap device
+    if [ ! -b "$zram_swap_device" ]; then
+        # Try using zramctl if available
+        if command -v zramctl >/dev/null; then
+            log_debug "Using zramctl to create ZRAM swap device..."
+            if ! zramctl --find --size "${swap_size_mib}M" --algorithm "${ZRAM_SWAP_ALGO}" >/dev/null 2>&1; then
+                log_debug "zramctl failed for swap, trying manual approach..."
+                # Manual configuration
+                echo "${ZRAM_SWAP_ALGO}" > /sys/class/block/zram${ZRAM_SWAP_DEVICE_NUM}/comp_algorithm 2>/dev/null || true
+                echo "${swap_size_mib}M" > /sys/class/block/zram${ZRAM_SWAP_DEVICE_NUM}/disksize 2>/dev/null
+            fi
+        else
+            # Manual configuration
+            log_debug "zramctl not available, using manual configuration for swap..."
+            echo "${ZRAM_SWAP_ALGO}" > /sys/class/block/zram${ZRAM_SWAP_DEVICE_NUM}/comp_algorithm 2>/dev/null || true
+            echo "${swap_size_mib}M" > /sys/class/block/zram${ZRAM_SWAP_DEVICE_NUM}/disksize 2>/dev/null
+        fi
+    fi
+    
+    # Wait for device to be ready
+    sleep 2
+    
+    # Verify device exists
+    if [ ! -b "$zram_swap_device" ]; then
+        log_error "ZRAM swap device $zram_swap_device does not exist after configuration!"
+        return 1
+    fi
+    
+    # Initialize swap on ZRAM device
+    log_debug "Initializing swap on $zram_swap_device..."
+    if mkswap "$zram_swap_device" >/dev/null 2>&1; then
+        log_info "ZRAM swap device created successfully (${swap_size_mib} MiB)"
+        
+        # Add ZRAM swap entry to fstab in ZRAM root
+        if [ -f "${ZRAM_TEMP_MNT}/etc/fstab" ]; then
+            echo "" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+            echo "# ZRAM Swap (replaces original drive swap for safety)" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+            echo "$zram_swap_device none swap sw,pri=${ZRAM_SWAP_PRIORITY} 0 0" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+            log_debug "Added ZRAM swap entry to /etc/fstab with priority ${ZRAM_SWAP_PRIORITY}"
+        fi
+        
+        return 0
+    else
+        log_error "Failed to initialize swap on $zram_swap_device!"
+        return 1
+    fi
 }
 
 # Check if zramroot parameter is in cmdline before doing anything
@@ -250,6 +529,9 @@ ZRAM_MOUNT_OPTS="defaults,noatime"; RAM_MIN_FREE_MiB=512
 ZRAM_BUFFER_PERCENT=10
 ZRAM_DEVICE_NUM=0; TRIGGER_PARAMETER="zramroot"; WAIT_TIMEOUT=5
 RAM_PREF_FREE_MiB=1024; ZRAM_MIN_FREE_MiB=256; ZRAM_MAX_FREE_MiB=35840
+# ZRAM Swap defaults
+ZRAM_SWAP_ENABLED="yes"; ZRAM_SWAP_DEVICE_NUM=1; ZRAM_SWAP_SIZE_MiB=0
+ZRAM_SWAP_ALGO="lz4"; ZRAM_SWAP_PRIORITY=10
 
 if [ -f "${CONFIG_FILE}" ]; then
     log_debug "Loading configuration from ${CONFIG_FILE}"
@@ -474,13 +756,25 @@ if mount -t "${ZRAM_FS_TYPE}" -o "rw,${ZRAM_MOUNT_OPTS}" "${ZRAM_DEVICE}" "${ZRA
                 sed 's|^\([^#].*[[:space:]]/home[[:space:]].*\)$|# ZRAMROOT: \1|g' "$temp_fstab.3" > "$temp_fstab.4"
                 sed 's|^\([^#].*[[:space:]]/var[[:space:]].*\)$|# ZRAMROOT: \1|g' "$temp_fstab.4" > "$temp_fstab.5"
                 
+                # CRITICAL: Comment out swap partitions from original drive to prevent mounting
+                # This ensures the original drive can be safely disconnected when using ZRAMroot
+                sed 's|^\([^#].*[[:space:]]swap[[:space:]].*\)$|# ZRAMROOT-SWAP-DISABLED: \1|g' "$temp_fstab.5" > "$temp_fstab.6"
+                
+                log_debug "Disabled original drive swap partitions in ZRAM fstab"
+                
                 # Copy the final result back
-                cp "$temp_fstab.5" "${ZRAM_TEMP_MNT}/etc/fstab"
+                cp "$temp_fstab.6" "${ZRAM_TEMP_MNT}/etc/fstab"
                 
                 # Clean up temporary files
-                rm -f "$temp_fstab" "$temp_fstab.2" "$temp_fstab.3" "$temp_fstab.4" "$temp_fstab.5"
+                rm -f "$temp_fstab" "$temp_fstab.2" "$temp_fstab.3" "$temp_fstab.4" "$temp_fstab.5" "$temp_fstab.6"
                 
                 log_debug "Successfully modified /etc/fstab"
+                
+                # Setup ZRAM swap if enabled
+                if [ "${ZRAM_SWAP_ENABLED}" = "yes" ]; then
+                    log_info "Setting up ZRAM swap..."
+                    setup_zram_swap
+                fi
             fi
         else
             log_error "Failed to copy files from physical root to ZRAM!"
