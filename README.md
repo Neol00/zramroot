@@ -40,14 +40,15 @@ This project is currently not finished, you might encounter bugs and end up with
    sudo ./install.sh
    ```
 5. Follow the prompts to complete installation
-6. Reboot and select the zramroot entry in your GRUB menu
+6. Reboot and select the zramroot entry in your bootloader menu
 
 The install script will:
-- Check for required files
+- Detect your bootloader (GRUB, systemd-boot, or extlinux)
+- Check for required dependencies and packages
 - Ask for additional kernel modules to include and load with the scripts during early boot (if needed)
 - Install all components to the appropriate locations
 - Create a backup of files it replaces
-- Add a new GRUB boot entry with the option to load to zram
+- Add a new boot entry with the option to load to zram
 
 ### Manual Installation
 
@@ -69,7 +70,9 @@ If you prefer to install manually, follow these steps:
    sudo chmod +x /usr/share/initramfs-tools/hooks/zramroot
    ```
 
-3. Edit your GRUB configuration to add a zramroot entry:
+3. Edit your bootloader configuration to add a zramroot entry:
+
+   **For GRUB:**
    - Create or edit `/etc/grub.d/40_custom` with an entry similar to:
    ```
    menuentry 'Linux (Load Root to ZRAM)' {
@@ -78,11 +81,40 @@ If you prefer to install manually, follow these steps:
      initrd /boot/initrd.img
    }
    ```
+   
+   **For systemd-boot:**
+   - Create `/boot/loader/entries/zramroot.conf`:
+   ```
+   title Linux (Load Root to ZRAM)
+   linux /vmlinuz
+   initrd /initrd.img
+   options root=UUID=YOUR_ROOT_UUID rw zramroot
+   ```
+   
+   **For extlinux:**
+   - Edit `/boot/extlinux/extlinux.conf` or `/boot/syslinux/syslinux.cfg` and add:
+   ```
+   LABEL zramroot
+   MENU LABEL Linux (Load Root to ZRAM)
+   KERNEL /boot/vmlinuz
+   APPEND root=UUID=YOUR_ROOT_UUID rw zramroot
+   INITRD /boot/initrd.img
+   ```
+   
    - Replace `YOUR_ROOT_UUID` with your actual root partition UUID (find it with `blkid`)
 
-4. Update GRUB and rebuild initramfs:
+4. Update your bootloader and rebuild initramfs:
    ```bash
+   # For GRUB:
    sudo update-grub
+   
+   # For systemd-boot:
+   sudo bootctl update
+   
+   # For extlinux:
+   sudo extlinux --update /boot/extlinux
+   
+   # Always rebuild initramfs:
    sudo update-initramfs -c -k all
    ```
 
@@ -133,13 +165,27 @@ ZRAM_BUFFER_PERCENT=10
 - `ESTIMATED_COMPRESSION_RATIO`: Expected compression ratio
 - `ZRAM_BUFFER_PERCENT`: Buffer percentage to add to root size
 
+#### ZRAM Swap Settings
+```
+ZRAM_SWAP_ENABLED="yes"
+ZRAM_SWAP_DEVICE_NUM=1
+ZRAM_SWAP_SIZE_MiB=0
+ZRAM_SWAP_ALGO="lz4"
+ZRAM_SWAP_PRIORITY=10
+```
+- `ZRAM_SWAP_ENABLED`: Enable ZRAM-based swap to replace original drive swap partitions
+- `ZRAM_SWAP_DEVICE_NUM`: ZRAM device number for swap (usually 1, since 0 is used for root)
+- `ZRAM_SWAP_SIZE_MiB`: ZRAM swap size in MiB (0 for automatic calculation based on system RAM)
+- `ZRAM_SWAP_ALGO`: Compression algorithm for swap (should match or be compatible with root ZRAM)
+- `ZRAM_SWAP_PRIORITY`: Priority for ZRAM swap (higher numbers = higher priority)
+
 #### Advanced Settings
 ```
 ZRAM_DEVICE_NUM=0
 TRIGGER_PARAMETER="zramroot"
 WAIT_TIMEOUT=30
 ```
-- `ZRAM_DEVICE_NUM`: ZRAM device number to use
+- `ZRAM_DEVICE_NUM`: ZRAM device number to use for root
 - `TRIGGER_PARAMETER`: Kernel parameter to activate zramroot
 - `WAIT_TIMEOUT`: Seconds to wait for root device to appear
 
@@ -162,7 +208,7 @@ zramroot includes comprehensive logging to help troubleshoot issues:
 3. **Common Issues**:
 
    - **System fails to boot with zramroot**:
-     - Boot with the normal GRUB entry (without zramroot)
+     - Boot with the normal bootloader entry (without zramroot)
      - Check logs in `/var/log/zramroot-*.log`
      - Verify your configuration settings
 
