@@ -1,0 +1,660 @@
+#!/usr/bin/ash
+# mkinitcpio hook for zramroot
+# This is busybox ash, not bash - be careful with syntax!
+
+run_hook() {
+    # --- CRITICAL: Check for zramroot kernel parameter FIRST ---
+    # Only proceed if "zramroot" is in kernel command line
+    if ! grep -q '\bzramroot\b' /proc/cmdline; then
+        # No zramroot parameter - exit silently and let normal boot continue
+        return 0
+    fi
+
+    # --- Global Variables ---
+    CONFIG_FILE="/etc/zramroot.conf"
+    DEBUG_MODE="no"
+    ZRAM_SIZE_MiB=0
+    ZRAM_ALGO="lz4"
+    ZRAM_FS_TYPE="ext4"
+    ZRAM_MOUNT_OPTS="noatime"
+    RAM_MIN_FREE_MiB=512
+    ZRAM_MIN_FREE_MiB=256
+    RAM_PREF_FREE_MiB=1024
+    ZRAM_MAX_FREE_MiB=35840
+    ZRAM_BUFFER_PERCENT=10
+    ZRAM_DEVICE_NUM=0
+    ZRAM_SWAP_ENABLED="yes"
+    ZRAM_SWAP_DEVICE_NUM=1
+    ZRAM_SWAP_SIZE_MiB=0
+    ZRAM_SWAP_ALGO="lz4"
+    ZRAM_SWAP_PRIORITY=10
+    ZRAM_TEMP_MNT="/zram_root"
+
+    # Load configuration
+    if [ -f "${CONFIG_FILE}" ]; then
+        . "${CONFIG_FILE}"
+    fi
+
+    # Set compression ratio based on algorithm
+    case "${ZRAM_ALGO}" in
+        "zstd") ESTIMATED_COMPRESSION_RATIO=3.0 ;;
+        "lz4hc") ESTIMATED_COMPRESSION_RATIO=2.5 ;;
+        "lz4") ESTIMATED_COMPRESSION_RATIO=2.0 ;;
+        "lzo"|"lzo-rle") ESTIMATED_COMPRESSION_RATIO=1.8 ;;
+        *) ESTIMATED_COMPRESSION_RATIO=2.2 ;;
+    esac
+
+    # --- Persistent Logging Setup ---
+    REAL_ROOT_MNT="/mnt/real_root_rw"
+    DATE_TIME=$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo "unknown")
+    REAL_ROOT_LOG_FILE="${REAL_ROOT_MNT}/var/log/zramroot-${DATE_TIME}.log"
+
+    # Function to ensure physical root is mounted for logging
+    ensure_physical_root_mounted() {
+        # Only attempt if not already mounted
+        if [ ! -d "${REAL_ROOT_MNT}" ] || ! mountpoint -q "${REAL_ROOT_MNT}" 2>/dev/null; then
+            mkdir -p "${REAL_ROOT_MNT}"
+
+            # Try to get the original root device
+            local orig_root="${root}"
+
+            if [ -n "$orig_root" ] && [ -b "$orig_root" ]; then
+                # Try to mount the physical root
+                if mount -o rw "$orig_root" "${REAL_ROOT_MNT}" 2>/dev/null; then
+                    mkdir -p "${REAL_ROOT_MNT}/var/log"
+                    touch "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+                    return 0
+                fi
+            fi
+        fi
+        return 0
+    }
+
+    # --- Logging Functions ---
+    log_kernel() {
+        echo "zramroot: $*" > /dev/kmsg 2>/dev/null || true
+    }
+
+    log_to_file() {
+        local MSG="$*"
+
+        # Only log to file if DEBUG_MODE=yes or this is an error message
+        if [ "${DEBUG_MODE}" = "yes" ] || echo "$MSG" | grep -q "ERROR"; then
+            # Ensure physical root is mounted for logging
+            ensure_physical_root_mounted
+
+            if [ -w "${REAL_ROOT_LOG_FILE}" ]; then
+                local now=""
+                if command -v date >/dev/null 2>&1; then
+                    now="$(date '+%Y-%m-%d %H:%M:%S')"
+                fi
+                echo "${now} $MSG" >> "${REAL_ROOT_LOG_FILE}"
+            fi
+        fi
+    }
+
+    log_info() {
+        log_kernel "$*"
+        log_to_file "INFO: $*"
+        [ "${DEBUG_MODE}" = "yes" ] && echo "zramroot: $*"
+    }
+
+    log_error() {
+        log_kernel "ERROR: $*"
+        log_to_file "ERROR: $*"
+        echo "zramroot: ERROR: $*"
+    }
+
+    log_debug() {
+        if [ "${DEBUG_MODE}" = "yes" ]; then
+            log_kernel "DEBUG: $*"
+            log_to_file "DEBUG: $*"
+            echo "zramroot: DEBUG: $*"
+        fi
+    }
+
+    # --- Progress Bar Functions ---
+    ESC='\033'
+    CLEAR_LINE="${ESC}[2K\r"
+    GREEN="${ESC}[0;32m"
+    YELLOW="${ESC}[1;33m"
+    BLUE="${ESC}[0;34m"
+    NC="${ESC}[0m"
+
+    draw_parallel_progress_bar() {
+        local percentage=$1
+        local total_threads=$2
+        local active_threads=${3:-$total_threads}
+        local bar_width=50
+        local filled=$((percentage * bar_width / 100))
+        local empty=$((bar_width - filled))
+
+        # Create the bar
+        local bar=""
+        local i=0
+
+        while [ $i -lt $filled ]; do
+            bar="${bar}█"
+            i=$((i + 1))
+        done
+
+        i=0
+        while [ $i -lt $empty ]; do
+            bar="${bar}░"
+            i=$((i + 1))
+        done
+
+        printf "\r${BLUE}[${GREEN}${bar}${BLUE}] ${GREEN}%3d%%${NC} ${YELLOW}[%d/%d threads]${NC} Copying...     " "$percentage" "$active_threads" "$total_threads"
+    }
+
+    # --- Detect Optimal Thread Count ---
+    detect_optimal_threads() {
+        local cpu_cores
+        cpu_cores=$(nproc 2>/dev/null || echo "1")
+        local available_ram_mb
+        available_ram_mb=$(($(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 1024))
+
+        local optimal_threads=$cpu_cores
+        local max_ram_threads=$((available_ram_mb / 75))
+
+        if [ "$max_ram_threads" -lt "$optimal_threads" ]; then
+            optimal_threads=$max_ram_threads
+        fi
+
+        if [ "$optimal_threads" -lt 1 ]; then
+            optimal_threads=1
+        elif [ "$optimal_threads" -gt 16 ]; then
+            optimal_threads=16
+        fi
+
+        log_debug "Using ${optimal_threads} parallel operations"
+        echo "$optimal_threads"
+    }
+
+    # --- Work Distribution for Parallel Copy ---
+    create_work_distribution() {
+        local source="$1"
+        local thread_count="$2"
+        local work_dir="/tmp/parallel_rsync_work"
+
+        mkdir -p "$work_dir"
+        rm -f "${work_dir}/job_"*
+
+        local dir_list="${work_dir}/directories.list"
+
+        # Get subdirectories, excluding special ones
+        find "$source" -maxdepth 1 -type d ! -path "$source" \
+            ! -name "dev" ! -name "proc" ! -name "sys" ! -name "tmp" \
+            ! -name "run" ! -name "mnt" ! -name "media" ! -name "lost+found" \
+            2>/dev/null | while read dir; do
+            if [ -d "$dir" ]; then
+                local size_kb
+                size_kb=$(du -sk "$dir" 2>/dev/null | awk '{print $1}' || echo "0")
+                local dir_name
+                dir_name=$(basename "$dir")
+                echo "${size_kb}:${dir_name}" >> "$dir_list"
+            fi
+        done
+
+        # Sort by size (largest first)
+        sort -rn -t: -k1 "$dir_list" > "${dir_list}.sorted"
+
+        # Initialize job files
+        local i=0
+        while [ $i -lt $thread_count ]; do
+            echo "0" > "${work_dir}/job_${i}.size"
+            touch "${work_dir}/job_${i}.list"
+            i=$((i + 1))
+        done
+
+        # Distribute directories using load balancing
+        while read line; do
+            if [ -n "$line" ]; then
+                local size
+                size=$(echo "$line" | cut -d: -f1)
+                local dir_name
+                dir_name=$(echo "$line" | cut -d: -f2)
+
+                # Find job with minimum size
+                local min_job=0
+                local min_size
+                min_size=$(cat "${work_dir}/job_0.size")
+
+                i=1
+                while [ $i -lt $thread_count ]; do
+                    local current_size
+                    current_size=$(cat "${work_dir}/job_${i}.size")
+                    if [ "$current_size" -lt "$min_size" ]; then
+                        min_size=$current_size
+                        min_job=$i
+                    fi
+                    i=$((i + 1))
+                done
+
+                # Add to job with minimum size
+                echo "$dir_name" >> "${work_dir}/job_${min_job}.list"
+                local new_size=$((min_size + size))
+                echo "$new_size" > "${work_dir}/job_${min_job}.size"
+            fi
+        done < "${dir_list}.sorted"
+
+        # Add root files to job 0
+        echo "ROOT_FILES" >> "${work_dir}/job_0.list"
+
+        echo "$work_dir"
+    }
+
+    # --- Parallel Copy with Progress ---
+    copy_with_parallel_progress() {
+        local source="$1"
+        local dest="$2"
+
+        log_info "Starting parallel copy from ${source} to ${dest}"
+
+        local thread_count
+        thread_count=$(detect_optimal_threads)
+
+        local total_kb
+        total_kb=$(du -sk "$source" 2>/dev/null | awk '{print $1}')
+
+        if [ -z "$total_kb" ] || [ "$total_kb" -eq 0 ]; then
+            log_error "Could not determine source size"
+            return 1
+        fi
+
+        log_debug "Total size: ${total_kb} KB"
+
+        local work_dir
+        work_dir=$(create_work_distribution "$source" "$thread_count")
+
+        # Display header
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "    Copying to ZRAM (${thread_count} parallel operations)"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+
+        draw_parallel_progress_bar 0 "$thread_count"
+
+        # Start rsync jobs in parallel
+        local i=0
+        while [ $i -lt $thread_count ]; do
+            local job_file="${work_dir}/job_${i}.list"
+            local job_log="${work_dir}/job_${i}.log"
+
+            if [ -s "$job_file" ]; then
+                (
+                    while read item; do
+                        if [ "$item" = "ROOT_FILES" ]; then
+                            rsync -ax \
+                                  --include="/*" --exclude="/*/" \
+                                  --exclude="/dev" --exclude="/proc" --exclude="/sys" \
+                                  --exclude="/tmp" --exclude="/run" --exclude="/mnt" \
+                                  --exclude="/media" --exclude="/lost+found" \
+                                  "${source}/" "${dest}/" 2>>"$job_log"
+                        else
+                            mkdir -p "${dest}/${item}"
+                            rsync -ax --delete \
+                                  "${source}/${item}/" "${dest}/${item}/" 2>>"$job_log"
+                        fi
+                    done < "$job_file"
+                ) &
+
+                local job_pid=$!
+                echo "$job_pid" > "${work_dir}/job_${i}.pid"
+                log_debug "Started job $i with PID $job_pid"
+            fi
+            i=$((i + 1))
+        done
+
+        # Monitor progress
+        local last_percentage=0
+        local max_wait=1800
+        local elapsed=0
+
+        while [ $elapsed -lt $max_wait ]; do
+            local running_jobs=0
+
+            i=0
+            while [ $i -lt $thread_count ]; do
+                local pid_file="${work_dir}/job_${i}.pid"
+                if [ -f "$pid_file" ]; then
+                    local job_pid
+                    job_pid=$(cat "$pid_file")
+                    if [ -n "$job_pid" ] && kill -0 "$job_pid" 2>/dev/null; then
+                        running_jobs=$((running_jobs + 1))
+                    fi
+                fi
+                i=$((i + 1))
+            done
+
+            if [ $running_jobs -eq 0 ]; then
+                break
+            fi
+
+            # Calculate progress
+            local current_kb
+            current_kb=$(du -sk "$dest" 2>/dev/null | awk '{print $1}')
+
+            if [ -n "$current_kb" ] && [ "$current_kb" -gt 0 ]; then
+                local current_percentage=$((current_kb * 100 / total_kb))
+
+                if [ "$current_percentage" -gt 99 ] && [ $running_jobs -gt 0 ]; then
+                    current_percentage=99
+                fi
+
+                if [ "$current_percentage" -ne "$last_percentage" ]; then
+                    draw_parallel_progress_bar "$current_percentage" "$thread_count" "$running_jobs"
+                    last_percentage=$current_percentage
+                fi
+            fi
+
+            sleep 2
+            elapsed=$((elapsed + 2))
+        done
+
+        # Wait for remaining jobs
+        local overall_exit=0
+        i=0
+        while [ $i -lt $thread_count ]; do
+            local pid_file="${work_dir}/job_${i}.pid"
+            if [ -f "$pid_file" ]; then
+                local job_pid
+                job_pid=$(cat "$pid_file")
+                if [ -n "$job_pid" ]; then
+                    wait "$job_pid"
+                    local job_exit=$?
+                    if [ $job_exit -ne 0 ]; then
+                        overall_exit=$job_exit
+                    fi
+                fi
+            fi
+            i=$((i + 1))
+        done
+
+        # Show 100%
+        draw_parallel_progress_bar 100 "$thread_count" 0
+        echo ""
+        echo ""
+
+        log_info "Parallel copy completed"
+
+        rm -rf "$work_dir"
+
+        return $overall_exit
+    }
+
+    # --- ZRAM Swap Setup ---
+    setup_zram_swap() {
+        log_debug "Setting up ZRAM swap device ${ZRAM_SWAP_DEVICE_NUM}"
+
+        local swap_size_mib="${ZRAM_SWAP_SIZE_MiB}"
+        if [ "$swap_size_mib" -eq 0 ]; then
+            local total_ram_kb
+            total_ram_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+            local total_ram_mib=$((total_ram_kb / 1024))
+
+            swap_size_mib=$((total_ram_mib / 4))
+            [ "$swap_size_mib" -gt 4096 ] && swap_size_mib=4096
+            [ "$swap_size_mib" -lt 512 ] && swap_size_mib=512
+
+            log_debug "Auto-calculated swap size: ${swap_size_mib} MiB"
+        fi
+
+        local zram_swap_device="/dev/zram${ZRAM_SWAP_DEVICE_NUM}"
+
+        if [ ! -b "$zram_swap_device" ]; then
+            if command -v zramctl >/dev/null 2>&1; then
+                zramctl --find --size "${swap_size_mib}M" --algorithm "${ZRAM_SWAP_ALGO}" >/dev/null 2>&1 || {
+                    echo "${ZRAM_SWAP_ALGO}" > /sys/class/block/zram${ZRAM_SWAP_DEVICE_NUM}/comp_algorithm 2>/dev/null || true
+                    echo "${swap_size_mib}M" > /sys/class/block/zram${ZRAM_SWAP_DEVICE_NUM}/disksize 2>/dev/null
+                }
+            else
+                echo "${ZRAM_SWAP_ALGO}" > /sys/class/block/zram${ZRAM_SWAP_DEVICE_NUM}/comp_algorithm 2>/dev/null || true
+                echo "${swap_size_mib}M" > /sys/class/block/zram${ZRAM_SWAP_DEVICE_NUM}/disksize 2>/dev/null
+            fi
+        fi
+
+        sleep 2
+
+        if [ ! -b "$zram_swap_device" ]; then
+            log_error "ZRAM swap device does not exist"
+            return 1
+        fi
+
+        if mkswap "$zram_swap_device" >/dev/null 2>&1; then
+            log_info "ZRAM swap created (${swap_size_mib} MiB)"
+
+            if [ -f "${ZRAM_TEMP_MNT}/etc/fstab" ]; then
+                echo "" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+                echo "# ZRAM Swap" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+                echo "$zram_swap_device none swap sw,pri=${ZRAM_SWAP_PRIORITY} 0 0" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+            fi
+
+            return 0
+        else
+            log_error "Failed to create swap on $zram_swap_device"
+            return 1
+        fi
+    }
+
+    # =================================================================
+    # MAIN EXECUTION STARTS HERE
+    # =================================================================
+
+    log_info "=== STARTING ZRAM ROOT SETUP PROCESS ==="
+
+    # Check available RAM
+    AVAILABLE_RAM_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+    [ -z "$AVAILABLE_RAM_KB" ] && AVAILABLE_RAM_KB=$(awk '/MemFree/ {print $2}' /proc/meminfo)
+
+    if [ -z "$AVAILABLE_RAM_KB" ]; then
+        log_error "Cannot determine available RAM"
+        return 1
+    fi
+
+    AVAILABLE_RAM_MiB=$((AVAILABLE_RAM_KB / 1024))
+    log_info "Available RAM: ${AVAILABLE_RAM_MiB} MiB"
+
+    # Validate root device is set
+    if [ -z "$root" ]; then
+        log_error "Root device not set by mkinitcpio"
+        return 1
+    fi
+
+    log_info "Root device: $root"
+
+    # Mount root device to calculate size
+    mkdir -p /local_root
+    poll_device "$root" 20
+
+    if ! mount "$root" /local_root; then
+        log_error "Failed to mount root device $root"
+        return 1
+    fi
+
+    ROOT_USED_KB=$(df -k /local_root | awk 'NR==2 {print $3}')
+    ROOT_USED_MiB=$((ROOT_USED_KB / 1024))
+    log_info "Used size on physical root: ${ROOT_USED_MiB} MiB"
+
+    # Add buffer
+    BUFFER_MiB=$((ROOT_USED_MiB * ZRAM_BUFFER_PERCENT / 100))
+    ROOT_WITH_BUFFER_MiB=$((ROOT_USED_MiB + BUFFER_MiB))
+
+    # Calculate expected compressed size
+    EXPECTED_COMPRESSED_ROOT_MiB=$(awk -v r="$ROOT_WITH_BUFFER_MiB" -v c="$ESTIMATED_COMPRESSION_RATIO" 'BEGIN{printf "%.0f", r / c}')
+    log_info "Expected compressed size: ${EXPECTED_COMPRESSED_ROOT_MiB} MiB (ratio: ${ESTIMATED_COMPRESSION_RATIO})"
+
+    # Determine ZRAM size
+    if [ "$ZRAM_SIZE_MiB" -gt 0 ]; then
+        FINAL_ZRAM_SIZE_MiB=$ZRAM_SIZE_MiB
+        log_info "Using configured ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+    else
+        # Calculate dynamically
+        if [ $((AVAILABLE_RAM_MiB - RAM_MIN_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB - ZRAM_MIN_FREE_MiB)) -le 0 ]; then
+            log_error "Insufficient RAM"
+            umount /local_root
+            return 1
+        fi
+
+        if [ $((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB - ZRAM_MIN_FREE_MiB)) -le 0 ]; then
+            FINAL_ZRAM_SIZE_MiB=$((EXPECTED_COMPRESSED_ROOT_MiB + ZRAM_MIN_FREE_MiB))
+        elif [ $((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB - ZRAM_MAX_FREE_MiB)) -le 0 ]; then
+            EXTRA_ZRAM=$((AVAILABLE_RAM_MiB - RAM_PREF_FREE_MiB - EXPECTED_COMPRESSED_ROOT_MiB))
+            FINAL_ZRAM_SIZE_MiB=$((EXPECTED_COMPRESSED_ROOT_MiB + EXTRA_ZRAM))
+        else
+            FINAL_ZRAM_SIZE_MiB=$((EXPECTED_COMPRESSED_ROOT_MiB + ZRAM_MAX_FREE_MiB))
+        fi
+
+        MIN_SAFE_ZRAM=$((EXPECTED_COMPRESSED_ROOT_MiB + (EXPECTED_COMPRESSED_ROOT_MiB / 4)))
+        if [ "$FINAL_ZRAM_SIZE_MiB" -lt "$MIN_SAFE_ZRAM" ]; then
+            FINAL_ZRAM_SIZE_MiB=$MIN_SAFE_ZRAM
+        fi
+
+        log_info "Auto-calculated ZRAM size: ${FINAL_ZRAM_SIZE_MiB} MiB"
+    fi
+
+    # Load zram module
+    if ! lsmod | grep -q '^zram '; then
+        modprobe zram || {
+            log_error "Failed to load zram module"
+            umount /local_root
+            return 1
+        }
+    fi
+
+    sleep 2
+
+    # Create ZRAM device
+    zram_device=""
+    if command -v zramctl >/dev/null 2>&1; then
+        zram_device=$(zramctl --find --size "${FINAL_ZRAM_SIZE_MiB}M" --algorithm "${ZRAM_ALGO}" 2>/dev/null)
+        if [ $? -ne 0 ] || [ -z "$zram_device" ]; then
+            log_debug "zramctl failed, using manual approach"
+            zram_device="/dev/zram${ZRAM_DEVICE_NUM}"
+            echo "${ZRAM_ALGO}" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/comp_algorithm 2>/dev/null || true
+            echo "${FINAL_ZRAM_SIZE_MiB}M" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/disksize 2>/dev/null
+        fi
+    else
+        zram_device="/dev/zram${ZRAM_DEVICE_NUM}"
+        echo "${ZRAM_ALGO}" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/comp_algorithm 2>/dev/null || true
+        echo "${FINAL_ZRAM_SIZE_MiB}M" > /sys/class/block/zram${ZRAM_DEVICE_NUM}/disksize 2>/dev/null
+    fi
+
+    sleep 2
+
+    if [ ! -b "$zram_device" ]; then
+        log_error "ZRAM device does not exist"
+        umount /local_root
+        return 1
+    fi
+
+    log_info "ZRAM device created: $zram_device"
+
+    # Format ZRAM device
+    mkfs_cmd="mkfs.${ZRAM_FS_TYPE}"
+    mkfs_opts=""
+
+    if [ "$ZRAM_FS_TYPE" = "ext4" ]; then
+        mkfs_opts="-F"
+    elif [ "$ZRAM_FS_TYPE" = "btrfs" ]; then
+        mkfs_opts="-f"
+    fi
+
+    if ! ${mkfs_cmd} ${mkfs_opts} "$zram_device" >/dev/null 2>&1; then
+        log_error "Failed to format ZRAM device"
+        umount /local_root
+        return 1
+    fi
+
+    log_info "ZRAM device formatted with ${ZRAM_FS_TYPE}"
+
+    # Mount ZRAM device
+    mkdir -p "${ZRAM_TEMP_MNT}"
+    if ! mount -t "${ZRAM_FS_TYPE}" -o "rw,${ZRAM_MOUNT_OPTS}" "$zram_device" "${ZRAM_TEMP_MNT}"; then
+        log_error "Failed to mount ZRAM device"
+        umount /local_root
+        return 1
+    fi
+
+    # Copy filesystem to ZRAM with parallel progress
+    log_info "Copying root filesystem to ZRAM..."
+    if ! copy_with_parallel_progress /local_root "${ZRAM_TEMP_MNT}"; then
+        log_error "Failed to copy filesystem"
+        umount "${ZRAM_TEMP_MNT}"
+        umount /local_root
+        return 1
+    fi
+
+    # Create required directories
+    for dir in dev proc sys run tmp; do
+        mkdir -p "${ZRAM_TEMP_MNT}/${dir}"
+        chmod 755 "${ZRAM_TEMP_MNT}/${dir}"
+    done
+
+    # Modify /etc/fstab
+    if [ -f "${ZRAM_TEMP_MNT}/etc/fstab" ]; then
+        cp "${ZRAM_TEMP_MNT}/etc/fstab" "${ZRAM_TEMP_MNT}/etc/fstab.zram_backup"
+
+        # Use temporary files for sed (busybox compatible)
+        temp_fstab="/tmp/fstab_temp.$$"
+
+        sed 's|^\([^#].*[[:space:]]/[[:space:]].*\)$|# ZRAMROOT: \1|g' "${ZRAM_TEMP_MNT}/etc/fstab" > "$temp_fstab"
+        sed 's|^\([^#].*[[:space:]]/boot[[:space:]].*\)$|# ZRAMROOT: \1|g' "$temp_fstab" > "$temp_fstab.2"
+        sed 's|^\([^#].*[[:space:]]/boot/efi[[:space:]].*\)$|# ZRAMROOT: \1|g' "$temp_fstab.2" > "$temp_fstab.3"
+        sed 's|^\([^#].*[[:space:]]/home[[:space:]].*\)$|# ZRAMROOT: \1|g' "$temp_fstab.3" > "$temp_fstab.4"
+        sed 's|^\([^#].*[[:space:]]swap[[:space:]].*\)$|# ZRAMROOT-SWAP-DISABLED: \1|g' "$temp_fstab.4" > "$temp_fstab.5"
+
+        cp "$temp_fstab.5" "${ZRAM_TEMP_MNT}/etc/fstab"
+        rm -f "$temp_fstab" "$temp_fstab.2" "$temp_fstab.3" "$temp_fstab.4" "$temp_fstab.5"
+
+        log_debug "Modified /etc/fstab"
+    fi
+
+    # Setup ZRAM swap if enabled
+    if [ "${ZRAM_SWAP_ENABLED}" = "yes" ]; then
+        log_info "Setting up ZRAM swap..."
+        setup_zram_swap
+    fi
+
+    # Unmount physical root
+    sync
+    umount /local_root
+
+    # Unmount ZRAM temporarily
+    sync
+    umount "${ZRAM_TEMP_MNT}"
+
+    # Unmount persistent logging root if it was mounted
+    if mountpoint -q "${REAL_ROOT_MNT}" 2>/dev/null; then
+        log_debug "Unmounting persistent log mount"
+        sync
+        umount "${REAL_ROOT_MNT}" 2>/dev/null || true
+    fi
+
+    log_info "ZRAM root setup completed successfully"
+
+    # Update root variable to point to ZRAM device
+    # This is critical - tells mkinitcpio the new root device
+    root=$zram_device
+
+    # Export variables needed by mount handler
+    export zram_device
+    export ZRAM_FS_TYPE
+    export ZRAM_MOUNT_OPTS
+    export root
+
+    # Set the mount handler for mkinitcpio
+    export mount_handler=zram_mount
+}
+
+# Define mount handler in global scope (outside run_hook)
+# This function is called by mkinitcpio's init to mount the root filesystem
+zram_mount() {
+    mount -t "${ZRAM_FS_TYPE}" -o "rw,${ZRAM_MOUNT_OPTS}" "$zram_device" "$1"
+}
+
+# Disable fsck for ZRAM device (called by mkinitcpio's init)
+fsck_root() {
+    :
+}

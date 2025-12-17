@@ -1,0 +1,147 @@
+#!/bin/bash
+# mkinitcpio install script for zramroot
+
+build() {
+    # Add required binaries
+    add_binary cp
+    add_binary rsync
+    add_binary mkfs.ext4
+    add_binary fsck.ext4
+    add_binary zramctl
+    add_binary blkid
+    add_binary mount
+    add_binary umount
+    add_binary sync
+    add_binary df
+    add_binary mkdir
+    add_binary chmod
+    add_binary sed
+    add_binary awk
+
+    # Add binaries required by hook script
+    add_binary du
+    add_binary nproc
+    add_binary find
+    add_binary sort
+    add_binary basename
+    add_binary cut
+    add_binary grep
+    add_binary modprobe
+    add_binary lsmod
+    add_binary mountpoint
+    add_binary rm
+    add_binary touch
+    add_binary cat
+    add_binary printf
+    add_binary sleep
+    add_binary date
+    add_binary mkswap
+
+    # Add directories
+    add_dir /local_root
+    add_dir /zram_root
+
+    # Add configuration file
+    if [ -f /etc/zramroot.conf ]; then
+        add_file /etc/zramroot.conf
+    else
+        # Create default config
+        cat > "${BUILDROOT}/etc/zramroot.conf" << 'EOF'
+# Configuration for ZRAM Root Boot
+
+# --- Debugging ---
+DEBUG_MODE="no"
+
+# --- ZRAM Device Settings ---
+ZRAM_SIZE_MiB=0
+ZRAM_ALGO="lz4"
+ZRAM_FS_TYPE="ext4"
+ZRAM_MOUNT_OPTS="noatime"
+
+# --- RAM Management Settings ---
+RAM_MIN_FREE_MiB=512
+RAM_PREF_FREE_MiB=1024
+ZRAM_MIN_FREE_MiB=256
+ZRAM_MAX_FREE_MiB=35840
+ZRAM_BUFFER_PERCENT=10
+
+# --- ZRAM Swap Settings ---
+ZRAM_SWAP_ENABLED="yes"
+ZRAM_SWAP_DEVICE_NUM=1
+ZRAM_SWAP_SIZE_MiB=0
+ZRAM_SWAP_ALGO="lz4"
+ZRAM_SWAP_PRIORITY=10
+
+# --- Advanced ---
+ZRAM_DEVICE_NUM=0
+EOF
+    fi
+
+    # Parse config for filesystem type and add appropriate tools
+    ZRAM_FS_TYPE="ext4"
+    if [ -f /etc/zramroot.conf ]; then
+        fs_type=$(grep "^ZRAM_FS_TYPE=" /etc/zramroot.conf | cut -d'"' -f2)
+        [ -n "$fs_type" ] && ZRAM_FS_TYPE="$fs_type"
+    fi
+
+    # Add filesystem-specific tools
+    case "${ZRAM_FS_TYPE}" in
+        btrfs)
+            add_binary mkfs.btrfs
+            add_binary btrfs
+            add_module btrfs
+            ;;
+        xfs)
+            add_binary mkfs.xfs
+            add_binary xfs_repair
+            add_module xfs
+            ;;
+    esac
+
+    # Add kernel modules
+    add_module zram
+    add_module ext4
+
+    # Parse config for compression algorithm and add appropriate modules
+    ZRAM_ALGO="lz4"
+    if [ -f /etc/zramroot.conf ]; then
+        algo=$(grep "^ZRAM_ALGO=" /etc/zramroot.conf | cut -d'"' -f2)
+        [ -n "$algo" ] && ZRAM_ALGO="$algo"
+    fi
+
+    case "${ZRAM_ALGO}" in
+        zstd)
+            add_module zstd
+            ;;
+        lz4|lz4hc)
+            add_module lz4
+            add_module lz4_compress
+            ;;
+        lzo|lzo-rle)
+            add_module lzo
+            add_module lzo_compress
+            ;;
+        *)
+            # Add all common compression modules for compatibility
+            add_module lz4
+            add_module lzo
+            add_module zstd
+            ;;
+    esac
+
+    # Add the hook script
+    add_runscript
+}
+
+help() {
+    cat <<HELPEOF
+This hook loads the root filesystem into zram during boot for Arch Linux
+with mkinitcpio. It provides the same functionality as the initramfs-tools
+version but adapted for Arch's init system.
+
+To use, add 'zramroot' to the HOOKS array in /etc/mkinitcpio.conf,
+then regenerate your initramfs with: mkinitcpio -P
+
+Configuration is stored in /etc/zramroot.conf
+HELPEOF
+}

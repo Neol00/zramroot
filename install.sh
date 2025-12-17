@@ -41,6 +41,50 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# Detect init system
+detect_init_system() {
+    print_info "Detecting init system..." >&2
+
+    # Check for mkinitcpio (Arch Linux and derivatives)
+    # Priority check: Look for mkinitcpio command and directory first
+    if command -v mkinitcpio >/dev/null 2>&1 && [ -d "/usr/lib/initcpio" ]; then
+        print_info "Detected: Arch-based system (mkinitcpio)" >&2
+        echo "mkinitcpio"
+        return 0
+    fi
+
+    # Check for initramfs-tools (Debian, Ubuntu, and derivatives)
+    if command -v update-initramfs >/dev/null 2>&1 && [ -d "/usr/share/initramfs-tools" ]; then
+        print_info "Detected: Debian/Ubuntu (initramfs-tools)" >&2
+        echo "initramfs-tools"
+        return 0
+    fi
+
+    # Check for dracut (Fedora, RHEL, openSUSE)
+    if command -v dracut >/dev/null 2>&1; then
+        print_error "Detected dracut init system" >&2
+        print_error "dracut is not currently supported by ZRAMroot" >&2
+        print_info "Supported systems: Debian/Ubuntu (initramfs-tools), Arch Linux (mkinitcpio)" >&2
+        echo "unsupported"
+        return 1
+    fi
+
+    # Unknown init system
+    print_error "Could not detect a supported init system" >&2
+    print_info "Supported systems:" >&2
+    print_info "  - Debian/Ubuntu (initramfs-tools)" >&2
+    print_info "  - Arch Linux/Artix/Manjaro (mkinitcpio)" >&2
+    echo "unknown"
+    return 1
+}
+
+INIT_SYSTEM=$(detect_init_system)
+
+if [ "$INIT_SYSTEM" = "unsupported" ] || [ "$INIT_SYSTEM" = "unknown" ]; then
+    print_error "Cannot continue installation on unsupported system"
+    exit 1
+fi
+
 print_header
 
 # Dependency checking function
@@ -73,7 +117,7 @@ check_dependencies() {
     # Function to check if binary exists
     check_binary() {
         local bin="$1"
-        
+
         # Check for shell builtins first
         case "$bin" in
             wait|kill|echo|printf|cd|pwd|test|true|false|shift|export|unset|set|read)
@@ -81,19 +125,33 @@ check_dependencies() {
                 return 0
                 ;;
         esac
-        
+
+        # Special handling for busybox on Arch/mkinitcpio systems
+        if [ "$bin" = "busybox" ] && [ "$INIT_SYSTEM" = "mkinitcpio" ]; then
+            # On Arch, busybox is in /usr/lib/initcpio/busybox
+            if [ -x "/usr/lib/initcpio/busybox" ]; then
+                return 0
+            fi
+            # Also check if mkinitcpio-busybox package is installed
+            if command -v pacman >/dev/null 2>&1; then
+                if pacman -Q mkinitcpio-busybox >/dev/null 2>&1; then
+                    return 0
+                fi
+            fi
+        fi
+
         # Check for external binaries
-        for dir in /bin /usr/bin /sbin /usr/sbin; do
+        for dir in /bin /usr/bin /sbin /usr/sbin /usr/lib/initcpio; do
             if [ -x "${dir}/${bin}" ]; then
                 return 0
             fi
         done
-        
+
         # For some binaries, also check if they're available via command -v
         if command -v "$bin" >/dev/null 2>&1; then
             return 0
         fi
-        
+
         return 1
     }
     
@@ -276,9 +334,18 @@ show_package_install_instructions() {
             print_info "For RHEL/CentOS systems, run:"
             echo "    sudo yum install ${packages[*]}"
             ;;
-        arch|manjaro)
-            print_info "For Arch Linux systems, run:"
-            echo "    sudo pacman -S ${packages[*]}"
+        arch|manjaro|artix)
+            # Special handling for busybox on Arch-based systems
+            local arch_packages=()
+            for pkg in "${packages[@]}"; do
+                if [ "$pkg" = "busybox" ]; then
+                    arch_packages+=("mkinitcpio-busybox")
+                else
+                    arch_packages+=("$pkg")
+                fi
+            done
+            print_info "For Arch Linux/Artix systems, run:"
+            echo "    sudo pacman -S ${arch_packages[*]}"
             ;;
         opensuse|suse)
             print_info "For openSUSE systems, run:"
@@ -312,10 +379,18 @@ print_header
 # Display warning and get confirmation
 print_warning "ZRAMroot might make your installation unbootable if not configured correctly."
 print_warning "This script will:"
-print_info "  • Replace /usr/share/initramfs-tools/scripts/local with ZRAMroot version"
-print_info "  • Install ZRAMroot hooks and configuration files"
-print_info "  • Optionally configure a bootloader entry (GRUB, systemd-boot, or extlinux)"
-print_info "  • Rebuild your initramfs to include ZRAMroot support"
+
+if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
+    print_info "  • Replace /usr/share/initramfs-tools/scripts/local with ZRAMroot version"
+    print_info "  • Install ZRAMroot hooks and configuration files"
+    print_info "  • Optionally configure a bootloader entry (GRUB, systemd-boot, or extlinux)"
+    print_info "  • Rebuild your initramfs to include ZRAMroot support"
+elif [ "$INIT_SYSTEM" = "mkinitcpio" ]; then
+    print_info "  • Install ZRAMroot hooks to /usr/lib/initcpio/"
+    print_info "  • Install configuration file to /etc/zramroot.conf"
+    print_info "  • Provide instructions for manual mkinitcpio.conf configuration"
+fi
+
 echo ""
 print_info "It is STRONGLY recommended to make a backup before continuing."
 echo ""
@@ -327,10 +402,28 @@ fi
 
 print_header
 
-# Check for required files
-FILES=("zramroot-boot" "local" "zramroot" "zramroot-config")
-MISSING=0
+# Check for required files based on init system
+print_info "Checking for required files for ${INIT_SYSTEM}..."
 
+if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
+    FILES=(
+        "initramfs-tools/scripts/local-premount/zramroot-boot"
+        "initramfs-tools/scripts/local"
+        "initramfs-tools/hooks/zramroot"
+        "initramfs-tools/conf.d/zramroot-config"
+    )
+elif [ "$INIT_SYSTEM" = "mkinitcpio" ]; then
+    FILES=(
+        "mkinitcpio/hooks/zramroot"
+        "mkinitcpio/install/zramroot"
+        "zramroot.conf"
+    )
+else
+    print_error "Unknown init system: ${INIT_SYSTEM}"
+    exit 1
+fi
+
+MISSING=0
 for file in "${FILES[@]}"; do
     if [ ! -f "$file" ]; then
         print_error "Required file not found: $file"
@@ -339,89 +432,105 @@ for file in "${FILES[@]}"; do
 done
 
 if [ $MISSING -eq 1 ]; then
-    print_error "Some required files are missing. Please make sure all files are in the current directory."
+    print_error "Some required files are missing. Please make sure all files are in the correct directory structure."
+    print_info "Expected directory structure:"
+    if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
+        print_info "  initramfs-tools/hooks/zramroot"
+        print_info "  initramfs-tools/scripts/local"
+        print_info "  initramfs-tools/scripts/local-premount/zramroot-boot"
+        print_info "  initramfs-tools/conf.d/zramroot-config"
+    else
+        print_info "  mkinitcpio/hooks/zramroot"
+        print_info "  mkinitcpio/install/zramroot"
+        print_info "  zramroot.conf"
+    fi
     exit 1
 fi
 
-# Get additional modules from user - use a loop to allow corrections
-print_header
-print_info "You can specify additional kernel modules to load during early boot."
-print_info "These might be needed for specific hardware support."
-print_info "Enter module names separated by spaces, or leave empty for no additional modules."
-echo ""
-
-# Initialize module selection variables
+# Get additional modules from user - only for initramfs-tools
 additional_modules=""
-module_selection_complete=false
 
-while [ "$module_selection_complete" = false ]; do
-    # Show current selection if any
-    if [ -n "$additional_modules" ]; then
-        print_info "Current module selection: $additional_modules"
-    fi
-    
-    # Read module input, pre-populate with current selection
-    read -e -p "Additional modules: " -i "$additional_modules" input_modules
-    additional_modules="$input_modules"
-    
-    # If no modules specified, we're done
-    if [ -z "$additional_modules" ]; then
-        print_info "No additional modules selected."
-        module_selection_complete=true
-        continue
-    fi
-    
+if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
+    print_header
+    print_info "You can specify additional kernel modules to load during early boot."
+    print_info "These might be needed for specific hardware support."
+    print_info "Enter module names separated by spaces, or leave empty for no additional modules."
     echo ""
-    print_info "Checking if modules exist in your system..."
-    
-    # Create arrays for existing and non-existing modules
-    # Important: Clear these arrays each time to prevent carrying over previous checks
-    existing_modules=()
-    nonexisting_modules=()
-    
-    # Check each module
-    for module in $additional_modules; do
-        if modinfo $module &>/dev/null || [ -f "/lib/modules/$(uname -r)/kernel/$module.ko" ] || find /lib/modules/$(uname -r) -name "${module}.ko*" | grep -q .; then
-            existing_modules+=("$module")
-            print_info "Module '$module' exists in the system."
-        else
-            nonexisting_modules+=("$module")
-            print_warning "Module '$module' was not found in the system."
+
+    # Initialize module selection variables
+    module_selection_complete=false
+
+    while [ "$module_selection_complete" = false ]; do
+        # Show current selection if any
+        if [ -n "$additional_modules" ]; then
+            print_info "Current module selection: $additional_modules"
         fi
-    done
-    
-    # Warn about non-existing modules
-    if [ ${#nonexisting_modules[@]} -gt 0 ]; then
-        echo ""
-        print_warning "The following modules were not found in your system:"
-        for module in "${nonexisting_modules[@]}"; do
-            echo "  - $module"
-        done
-        echo ""
-        print_warning "These modules might not load correctly during boot."
-        read -p "Do you want to continue with these modules? (y/n): " include_nonexisting
-        
-        if [[ ! "$include_nonexisting" =~ ^[Yy]$ ]]; then
-            print_info "Please correct your module selection."
-            # Continue loop without setting module_selection_complete
+
+        # Read module input, pre-populate with current selection
+        read -e -p "Additional modules: " -i "$additional_modules" input_modules
+        additional_modules="$input_modules"
+
+        # If no modules specified, we're done
+        if [ -z "$additional_modules" ]; then
+            print_info "No additional modules selected."
+            module_selection_complete=true
             continue
         fi
-    fi
-    
-    # Final confirmation of modules
-    echo ""
-    print_info "The following modules will be added:"
-    echo "$additional_modules"
-    echo ""
-    read -p "Is this correct? (y/n): " confirm_modules
-    
-    if [[ "$confirm_modules" =~ ^[Yy]$ ]]; then
-        module_selection_complete=true
-    else
-        print_info "Please correct your module selection."
-        # Loop continues with current selection in the input field
-    fi
-done
+
+        echo ""
+        print_info "Checking if modules exist in your system..."
+
+        # Create arrays for existing and non-existing modules
+        # Important: Clear these arrays each time to prevent carrying over previous checks
+        existing_modules=()
+        nonexisting_modules=()
+
+        # Check each module
+        for module in $additional_modules; do
+            if modinfo $module &>/dev/null || [ -f "/lib/modules/$(uname -r)/kernel/$module.ko" ] || find /lib/modules/$(uname -r) -name "${module}.ko*" | grep -q .; then
+                existing_modules+=("$module")
+                print_info "Module '$module' exists in the system."
+            else
+                nonexisting_modules+=("$module")
+                print_warning "Module '$module' was not found in the system."
+            fi
+        done
+
+        # Warn about non-existing modules
+        if [ ${#nonexisting_modules[@]} -gt 0 ]; then
+            echo ""
+            print_warning "The following modules were not found in your system:"
+            for module in "${nonexisting_modules[@]}"; do
+                echo "  - $module"
+            done
+            echo ""
+            print_warning "These modules might not load correctly during boot."
+            read -p "Do you want to continue with these modules? (y/n): " include_nonexisting
+
+            if [[ ! "$include_nonexisting" =~ ^[Yy]$ ]]; then
+                print_info "Please correct your module selection."
+                # Continue loop without setting module_selection_complete
+                continue
+            fi
+        fi
+
+        # Final confirmation of modules
+        echo ""
+        print_info "The following modules will be added:"
+        echo "$additional_modules"
+        echo ""
+        read -p "Is this correct? (y/n): " confirm_modules
+
+        if [[ "$confirm_modules" =~ ^[Yy]$ ]]; then
+            module_selection_complete=true
+        else
+            print_info "Please correct your module selection."
+            # Loop continues with current selection in the input field
+        fi
+    done
+else
+    print_info "Skipping additional module selection (not applicable for mkinitcpio)"
+fi
 
 print_header
 print_warning "Please wait until the installation is complete."
@@ -438,7 +547,7 @@ backup_file() {
         print_info "Skipping backup of $file (GRUB directory - backups cause duplicate menu entries)"
         return
     fi
-    
+
     if [ -f "$file" ]; then
         # Create backup in /tmp instead of in-place to avoid issues
         local backup_dir="/tmp/zramroot-backups-$(date +%Y%m%d)"
@@ -449,42 +558,121 @@ backup_file() {
     fi
 }
 
-# Create directory structure if it doesn't exist
-print_info "Creating directory structure..."
-mkdir -p /usr/share/initramfs-tools/scripts/local-premount
-mkdir -p /usr/share/initramfs-tools/hooks
-mkdir -p /usr/share/initramfs-tools/conf.d
+# Install based on init system
+if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
+    print_info "Installing for initramfs-tools (Debian/Ubuntu)..."
 
-# Add user modules to the hook script if provided
-if [ -n "$additional_modules" ]; then
-    print_info "Adding custom modules to hook script..."
-    # Create a temporary file with the modified content
-    cat "zramroot" | sed "s/^EXTRA_MODULES=.*/EXTRA_MODULES=\"$additional_modules\"/" > zramroot.modified
-    mv zramroot.modified zramroot
-    chmod +x zramroot
+    # Create directory structure
+    print_info "Creating directory structure..."
+    mkdir -p /usr/share/initramfs-tools/scripts/local-premount
+    mkdir -p /usr/share/initramfs-tools/hooks
+    mkdir -p /usr/share/initramfs-tools/conf.d
+
+    # Add user modules to the hook script if provided
+    if [ -n "$additional_modules" ]; then
+        print_info "Adding custom modules to hook script..."
+        # Create a temporary file with the modified content
+        cat "initramfs-tools/hooks/zramroot" | sed "s/^EXTRA_MODULES=.*/EXTRA_MODULES=\"$additional_modules\"/" > /tmp/zramroot.modified
+        mv /tmp/zramroot.modified initramfs-tools/hooks/zramroot
+        chmod +x initramfs-tools/hooks/zramroot
+    fi
+
+    # Backup existing files
+    backup_file "/usr/share/initramfs-tools/scripts/local"
+    backup_file "/usr/share/initramfs-tools/conf.d/zramroot-config"
+    backup_file "/etc/zramroot.conf"
+
+    # Copy files
+    print_info "Copying initramfs-tools files..."
+    cp "initramfs-tools/scripts/local-premount/zramroot-boot" "/usr/share/initramfs-tools/scripts/local-premount/zramroot-boot"
+    chmod +x "/usr/share/initramfs-tools/scripts/local-premount/zramroot-boot"
+
+    cp "initramfs-tools/scripts/local" "/usr/share/initramfs-tools/scripts/local"
+    chmod +x "/usr/share/initramfs-tools/scripts/local"
+
+    cp "initramfs-tools/hooks/zramroot" "/usr/share/initramfs-tools/hooks/zramroot"
+    chmod +x "/usr/share/initramfs-tools/hooks/zramroot"
+
+    cp "initramfs-tools/conf.d/zramroot-config" "/usr/share/initramfs-tools/conf.d/zramroot-config"
+    cp "initramfs-tools/conf.d/zramroot-config" "/etc/zramroot.conf"
+
+elif [ "$INIT_SYSTEM" = "mkinitcpio" ]; then
+    print_info "Installing for mkinitcpio (Arch Linux)..."
+
+    # Create directory structure
+    print_info "Creating directory structure..."
+    mkdir -p /usr/lib/initcpio/hooks
+    mkdir -p /usr/lib/initcpio/install
+
+    # Backup existing files
+    backup_file "/usr/lib/initcpio/hooks/zramroot"
+    backup_file "/usr/lib/initcpio/install/zramroot"
+    backup_file "/etc/zramroot.conf"
+
+    # Copy files
+    print_info "Copying mkinitcpio files..."
+    cp "mkinitcpio/hooks/zramroot" "/usr/lib/initcpio/hooks/zramroot"
+    chmod +x "/usr/lib/initcpio/hooks/zramroot"
+
+    cp "mkinitcpio/install/zramroot" "/usr/lib/initcpio/install/zramroot"
+    chmod +x "/usr/lib/initcpio/install/zramroot"
+
+    cp "zramroot.conf" "/etc/zramroot.conf"
+
+    print_success "mkinitcpio files installed successfully!"
+
+    # Automatically configure mkinitcpio.conf
+    print_info ""
+    print_info "=== Configuring mkinitcpio.conf ==="
+
+    MKINITCPIO_CONF="/etc/mkinitcpio.conf"
+
+    if [ ! -f "$MKINITCPIO_CONF" ]; then
+        print_error "mkinitcpio.conf not found at $MKINITCPIO_CONF"
+        exit 1
+    fi
+
+    # Backup mkinitcpio.conf
+    backup_file "$MKINITCPIO_CONF"
+
+    # Check if zramroot is already in HOOKS
+    if grep "^HOOKS=" "$MKINITCPIO_CONF" | grep -q "zramroot"; then
+        print_warning "zramroot hook already present in HOOKS array"
+    else
+        print_info "Adding zramroot hook to HOOKS array..."
+
+        # Add zramroot before filesystems in HOOKS array
+        # This handles both cases: with and without spaces around 'filesystems'
+        if grep "^HOOKS=" "$MKINITCPIO_CONF" | grep -q "filesystems"; then
+            # Use sed to add zramroot before filesystems
+            sed -i 's/\(HOOKS=([^)]*\)\<filesystems\>/\1zramroot filesystems/' "$MKINITCPIO_CONF"
+            print_success "Added zramroot hook before filesystems"
+        else
+            print_warning "Could not find 'filesystems' in HOOKS array"
+            print_info "Please manually add 'zramroot' to HOOKS in $MKINITCPIO_CONF"
+            print_info "Example: HOOKS=(base udev autodetect modconf block zramroot filesystems keyboard fsck)"
+        fi
+    fi
+
+    # Show the current HOOKS configuration
+    print_info "Current HOOKS configuration:"
+    grep "^HOOKS=" "$MKINITCPIO_CONF" | sed 's/^/  /'
+    echo ""
+
+    # Rebuild initramfs
+    print_info "=== Rebuilding initramfs ==="
+    print_warning "This may take a minute..."
+
+    if mkinitcpio -P; then
+        print_success "Initramfs rebuilt successfully!"
+    else
+        print_error "Failed to rebuild initramfs"
+        print_info "You may need to run 'sudo mkinitcpio -P' manually"
+        exit 1
+    fi
+
+    print_success "mkinitcpio configuration completed!"
 fi
-
-# Copy files to their destinations
-print_info "Copying files to system directories..."
-
-# Backup existing files
-backup_file "/usr/share/initramfs-tools/scripts/local"
-backup_file "/etc/grub.d/40_custom"
-backup_file "/usr/share/initramfs-tools/conf.d/zramroot-config"
-backup_file "/etc/zramroot.conf"
-
-# Copy files
-cp "zramroot-boot" "/usr/share/initramfs-tools/scripts/local-premount/zramroot-boot"
-chmod +x "/usr/share/initramfs-tools/scripts/local-premount/zramroot-boot"
-
-cp "local" "/usr/share/initramfs-tools/scripts/local"
-chmod +x "/usr/share/initramfs-tools/scripts/local"
-
-cp "zramroot" "/usr/share/initramfs-tools/hooks/zramroot"
-chmod +x "/usr/share/initramfs-tools/hooks/zramroot"
-
-cp "zramroot-config" "/usr/share/initramfs-tools/conf.d/zramroot-config"
-cp "zramroot-config" "/etc/zramroot.conf"
 
 # Bootloader Configuration
 echo ""
@@ -878,7 +1066,8 @@ if [ -f "$grub_config" ]; then
     
     # Get kernel and initrd paths
     kernel_path=$(grep -m1 -oP '\tlinux\s+\K[^\s]+' "$grub_config" | head -1)
-    initrd_path=$(grep -m1 -oP '\tinitrd\s+\K[^\s]+' "$grub_config" | head -1)
+    # Get ALL initrd paths (microcode + initramfs), not just the first one
+    initrd_path=$(grep -m1 -oP '\tinitrd\s+\K.*' "$grub_config" | head -1 | sed 's/[[:space:]]*$//')
     
     # Check for devicetree
     if grep -q "devicetree" "$grub_config"; then
@@ -1276,46 +1465,51 @@ elif [ "$bootloader" = "skip" ]; then
 
 fi
 
-# Update initramfs
-print_info "Updating initramfs..."
-if ! update-initramfs -u -k all; then
-    print_error "Failed to update initramfs."
-    print_info "You may need to run 'update-initramfs -u -k all' manually."
+# Update initramfs/initcpio
+if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
+    print_info "Updating initramfs..."
+    if ! update-initramfs -u -k all; then
+        print_error "Failed to update initramfs."
+        print_info "You may need to run 'update-initramfs -u -k all' manually."
+    fi
 fi
 
 print_header
 print_success "ZRAMroot installation completed!"
 echo ""
 
-# Display bootloader-specific success messages
-case "$bootloader" in
-    "grub")
-        print_info "A new GRUB menu entry has been added: '${os_name} (Load Root to ZRAM)'"
-        print_info "You can select this entry at boot time to use ZRAMroot."
-        ;;
-    "systemd-boot")
-        print_info "A new systemd-boot entry has been added: '${distro_name} (ZRAMroot)'"
-        print_info "You can select this entry at boot time to use ZRAMroot."
-        ;;
-    "extlinux")
-        print_info "A new extlinux/syslinux entry has been added: '${distro_name} (ZRAMroot)'"
-        print_info "You can select this entry at boot time to use ZRAMroot."
-        ;;
-    "manual")
-        print_warning "Manual bootloader configuration is required!"
-        print_info "Please create a boot entry with the 'zramroot' kernel parameter."
-        ;;
-    "skip")
-        print_info "Bootloader configuration was skipped."
-        print_warning "Remember to manually add 'zramroot' to your kernel parameters when ready."
-        ;;
-esac
-echo ""
-print_info "Configuration file is located at: /etc/zramroot.conf"
-print_info "You can edit this file to change ZRAMroot settings."
-echo ""
-print_warning "Remember that after modifying the configuration, you need to update the initramfs:"
-print_info "  sudo update-initramfs -u -k all"
+if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
+    # Display bootloader-specific success messages
+    case "$bootloader" in
+        "grub")
+            print_info "A new GRUB menu entry has been added: '${os_name} (Load Root to ZRAM)'"
+            print_info "You can select this entry at boot time to use ZRAMroot."
+            ;;
+        "systemd-boot")
+            print_info "A new systemd-boot entry has been added: '${distro_name} (ZRAMroot)'"
+            print_info "You can select this entry at boot time to use ZRAMroot."
+            ;;
+        "extlinux")
+            print_info "A new extlinux/syslinux entry has been added: '${distro_name} (ZRAMroot)'"
+            print_info "You can select this entry at boot time to use ZRAMroot."
+            ;;
+        "manual")
+            print_warning "Manual bootloader configuration is required!"
+            print_info "Please create a boot entry with the 'zramroot' kernel parameter."
+            ;;
+        "skip")
+            print_info "Bootloader configuration was skipped."
+            print_warning "Remember to manually add 'zramroot' to your kernel parameters when ready."
+            ;;
+    esac
+    echo ""
+    print_info "Configuration file is located at: /etc/zramroot.conf"
+    print_info "You can edit this file to change ZRAMroot settings."
+    echo ""
+    print_warning "Remember that after modifying the configuration, you need to update the initramfs:"
+    print_info "  sudo update-initramfs -u -k all"
+fi
+
 echo ""
 print_info "Press any key to exit..."
 read -n 1

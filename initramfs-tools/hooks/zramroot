@@ -1,0 +1,399 @@
+#!/bin/sh
+
+# initramfs-tools hook script for zramroot
+
+PREREQ=""
+
+log_hook() {
+    echo "zramroot hook: $@" >&2
+}
+
+log_debug() {
+    if [ "${DEBUG_MODE}" = "yes" ]; then
+        echo "zramroot hook-debug: $@" >&2
+    fi
+}
+
+prereqs() {
+    echo "$PREREQ"
+}
+
+case "$1" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+# Source the initramfs hook functions
+. /usr/share/initramfs-tools/hook-functions
+
+# Parse config file for debug mode
+DEBUG_MODE="no"
+CONFIG_FILE="/etc/zramroot.conf"
+if [ -f "${CONFIG_FILE}" ]; then
+    # Extract DEBUG_MODE value - safer than sourcing the whole file
+    debug_setting=$(grep "^DEBUG_MODE=" "${CONFIG_FILE}" | cut -d'"' -f2)
+    if [ "${debug_setting}" = "yes" ]; then
+        DEBUG_MODE="yes"
+        log_hook "Debug mode enabled from config file"
+    fi
+fi
+
+# --- Binaries needed by the boot script ---
+log_hook "Copying necessary binaries..."
+
+# Core utilities 
+copy_bin_list="busybox sh mount umount mkdir rmdir echo cat grep sed df awk rsync cp touch date \
+               mountpoint zramctl lsmod modprobe fsck blkid udevadm fuser find tail head ls sync \
+               mkfs.ext4 fsck.ext4"
+
+for bin in $copy_bin_list; do
+    # Try to find the binary in common locations
+    bin_path=""
+    for dir in /bin /usr/bin /sbin /usr/sbin; do
+        if [ -x "${dir}/${bin}" ]; then
+            bin_path="${dir}/${bin}"
+            break
+        fi
+    done
+    
+    if [ -n "${bin_path}" ]; then
+        log_debug "Copying ${bin_path}"
+        copy_exec "${bin_path}"
+    else
+        log_hook "Warning: Binary ${bin} not found!"
+    fi
+done
+
+# --- LVM2 Support Detection and Setup ---
+log_hook "Checking if LVM2 support is needed..."
+
+# Check if the current root device is on LVM2
+ROOT_DEVICE="${ROOT:-$(grep '^[^#]*root=' /proc/cmdline | sed 's/.*root=\([^[:space:]]*\).*/\1/')}"
+LVM_NEEDED="no"
+
+if [ -n "${ROOT_DEVICE}" ]; then
+    # Check if root device looks like an LVM device
+    if echo "${ROOT_DEVICE}" | grep -q "/dev/mapper/\|/dev/.*-.*"; then
+        log_hook "Root device appears to be LVM-based: ${ROOT_DEVICE}"
+        LVM_NEEDED="yes"
+    fi
+    
+    # Also check if LVM2 is actually installed and active
+    if [ "${LVM_NEEDED}" = "yes" ] && command -v vgdisplay >/dev/null 2>&1; then
+        # Check if there are active volume groups
+        if vgdisplay 2>/dev/null | grep -q "VG Status.*available"; then
+            log_hook "Active LVM2 volume groups detected"
+            LVM_NEEDED="yes"
+        else
+            log_hook "No active LVM2 volume groups found"
+            LVM_NEEDED="no"
+        fi
+    elif [ "${LVM_NEEDED}" = "yes" ]; then
+        log_hook "LVM2 tools not found, disabling LVM2 support"
+        LVM_NEEDED="no"
+    fi
+fi
+
+# Include LVM2 tools only if needed and available
+if [ "${LVM_NEEDED}" = "yes" ]; then
+    log_hook "Including LVM2 tools in initramfs..."
+    lvm_tools="vgchange lvchange dmsetup lvscan vgscan pvscan"
+    
+    for tool in $lvm_tools; do
+        tool_path=""
+        for dir in /sbin /usr/sbin /bin /usr/bin; do
+            if [ -x "${dir}/${tool}" ]; then
+                tool_path="${dir}/${tool}"
+                break
+            fi
+        done
+        
+        if [ -n "${tool_path}" ]; then
+            log_debug "Copying LVM2 tool: ${tool_path}"
+            copy_exec "${tool_path}"
+        else
+            log_hook "Warning: LVM2 tool ${tool} not found!"
+        fi
+    done
+    
+    # Mark that LVM2 support is available
+    echo "LVM_SUPPORT=yes" > "${DESTDIR}/conf/lvm_support"
+else
+    log_hook "LVM2 support not needed or not available"
+    echo "LVM_SUPPORT=no" > "${DESTDIR}/conf/lvm_support"
+fi
+
+# Additional binaries that might be useful for debugging
+debug_bin_list="lsmod ps dmesg free"
+if [ "${DEBUG_MODE}" = "yes" ]; then
+    for bin in $debug_bin_list; do
+        for dir in /bin /usr/bin /sbin /usr/sbin; do
+            if [ -x "${dir}/${bin}" ]; then
+                log_debug "Copying debug binary ${dir}/${bin}"
+                copy_exec "${dir}/${bin}"
+                break
+            fi
+        done
+    done
+fi
+
+# Filesystem related (Ensure all needed mkfs/fsck variants are included based on ZRAM_FS_TYPE)
+# Get filesystem type from config
+ZRAM_FS_TYPE="ext4" # Default
+if [ -f "${CONFIG_FILE}" ]; then
+    fs_type=$(grep "^ZRAM_FS_TYPE=" "${CONFIG_FILE}" | cut -d'"' -f2)
+    if [ -n "${fs_type}" ]; then
+        ZRAM_FS_TYPE="${fs_type}"
+        log_hook "Found filesystem type in config: ${ZRAM_FS_TYPE}"
+    fi
+fi
+
+log_hook "Copying filesystem tools for ${ZRAM_FS_TYPE}..."
+# Always include ext4 as it's the default/fallback
+copy_exec /sbin/mkfs.ext4 /sbin
+copy_exec /sbin/fsck.ext4 /sbin
+
+# Add specific filesystem tools based on configuration
+case "${ZRAM_FS_TYPE}" in
+    btrfs)
+        if [ -x /sbin/mkfs.btrfs ]; then
+            log_debug "Copying btrfs tools"
+            copy_exec /sbin/mkfs.btrfs /sbin
+            copy_exec /sbin/btrfs /sbin
+        else
+            log_hook "Warning: btrfs tools not found but btrfs selected!"
+        fi
+        ;;
+    xfs)
+        if [ -x /sbin/mkfs.xfs ]; then
+            log_debug "Copying xfs tools"
+            copy_exec /sbin/mkfs.xfs /sbin
+            copy_exec /sbin/xfs_repair /sbin
+        else
+            log_hook "Warning: xfs tools not found but xfs selected!"
+        fi
+        ;;
+esac
+
+# Always include fsck
+copy_exec /sbin/fsck /sbin
+
+# --- Kernel Modules ---
+log_hook "Adding required kernel modules..."
+
+# Add the zram module using the standard mechanism
+log_hook "Adding zram module..."
+manual_add_modules zram
+
+# Add filesystem modules
+log_hook "Adding filesystem modules..."
+manual_add_modules ext4   # Always include ext4 as fallback
+
+# Add other filesystems based on configuration
+case "${ZRAM_FS_TYPE}" in
+    btrfs)
+        log_debug "Adding btrfs module"
+        manual_add_modules btrfs
+        ;;
+    xfs)
+        log_debug "Adding xfs module"
+        manual_add_modules xfs
+        ;;
+esac
+
+# Get compression algorithm from config
+ZRAM_ALGO="zstd" # Default
+if [ -f "${CONFIG_FILE}" ]; then
+    algo=$(grep "^ZRAM_ALGO=" "${CONFIG_FILE}" | cut -d'"' -f2)
+    if [ -n "${algo}" ]; then
+        ZRAM_ALGO="${algo}"
+        log_hook "Found compression algorithm in config: ${ZRAM_ALGO}"
+    fi
+fi
+
+# Add compression modules based on algorithm
+log_hook "Adding compression modules for algorithm: ${ZRAM_ALGO}..."
+case "${ZRAM_ALGO}" in
+    zstd)
+        log_debug "Adding zstd module"
+        manual_add_modules zstd
+        ;;
+    lz4)
+        log_debug "Adding lz4 module"
+        manual_add_modules lz4
+        ;;
+    lzo)
+        log_debug "Adding lzo module"
+        manual_add_modules lzo
+        ;;
+    *)
+        log_hook "Adding all compression modules for compatibility"
+        manual_add_modules zstd
+        manual_add_modules lz4
+        manual_add_modules lzo
+        ;;
+esac
+
+# Add extra modules
+EXTRA_MODULES=""
+
+log_hook "Adding Extra modules: ${EXTRA_MODULES}"
+for module in ${EXTRA_MODULES}; do
+    log_debug "Adding module: ${module}"
+    manual_add_modules "${module}"
+done
+
+# --- Configuration File ---
+log_hook "Copying configuration file..."
+CONFIG_SOURCE="/etc/zramroot.conf"
+CONFIG_ALT_SOURCE="/usr/share/initramfs-tools/conf.d/zramroot-config" # Alternative path
+CONFIG_DEST="${DESTDIR}/conf/zramroot-config" # Path in initramfs
+
+mkdir -p "${DESTDIR}/conf"
+
+if [ -f "${CONFIG_SOURCE}" ]; then
+    cp "${CONFIG_SOURCE}" "${CONFIG_DEST}"
+    log_hook "Configuration file copied from ${CONFIG_SOURCE} to ${CONFIG_DEST}"
+    
+    # Log config file content in debug mode
+    if [ "${DEBUG_MODE}" = "yes" ]; then
+        log_debug "Configuration file content:"
+        cat "${CONFIG_SOURCE}" | while read line; do
+            log_debug "CONFIG: $line"
+        done
+    fi
+elif [ -f "${CONFIG_ALT_SOURCE}" ]; then
+    cp "${CONFIG_ALT_SOURCE}" "${CONFIG_DEST}"
+    log_hook "Configuration file copied from ${CONFIG_ALT_SOURCE} to ${CONFIG_DEST}"
+    
+    # Log config file content in debug mode
+    if [ "${DEBUG_MODE}" = "yes" ]; then
+        log_debug "Configuration file content:"
+        cat "${CONFIG_ALT_SOURCE}" | while read line; do
+            log_debug "CONFIG: $line"
+        done
+    fi
+else
+    log_hook "Configuration file not found! Creating a default one in ${CONFIG_DEST}."
+    # Create default config file
+    cat > "${CONFIG_DEST}" << EOF
+# Configuration for ZRAM Root Boot with persistent logging
+
+# --- Debugging ---
+# Enable verbose logging to the physical root partition at /var/log/zramroot.log
+DEBUG_MODE="no"
+
+# --- ZRAM Device Settings ---
+# Manually specify ZRAM device size in MiB.
+# If set to 0, size will be calculated automatically.
+ZRAM_SIZE_MiB=0
+
+# Compression algorithm (e.g., lz4, zstd, lzo-rle).
+ZRAM_ALGO="lz4"
+
+# Filesystem type for ZRAM device (e.g., ext4, btrfs, xfs)
+ZRAM_FS_TYPE="ext4"
+
+# Mount options for the ZRAM filesystem
+ZRAM_MOUNT_OPTS="rw,noatime"
+
+# --- RAM Management Settings ---
+# Minimum amount of RAM (in MiB) to leave free after allocating ZRAM
+RAM_MIN_FREE_MiB=512
+
+# Preferred amount of RAM (in MiB) to leave free after allocating ZRAM
+RAM_PREF_FREE_MiB=512
+
+# Minimum ZRAM space (in MiB) to leave free for growth
+ZRAM_MIN_FREE_MiB=256
+
+# Maximum ZRAM space (in MiB) to allocate for growth
+ZRAM_MAX_FREE_MiB=35840
+
+# --- Resource Calculation (Used only if ZRAM_SIZE_MiB is 0) ---
+# Buffer percentage to add to the original used size when calculating ZRAM size automatically.
+ZRAM_BUFFER_PERCENT=10
+
+# --- ZRAM Swap Settings ---
+# Enable ZRAM-based swap to replace original drive swap partitions
+ZRAM_SWAP_ENABLED="yes"
+
+# ZRAM swap device number (usually 1, since 0 is used for root)
+ZRAM_SWAP_DEVICE_NUM=1
+
+# ZRAM swap size in MiB (0 = auto-calculate based on system RAM)
+ZRAM_SWAP_SIZE_MiB=0
+
+# ZRAM swap compression algorithm (should match or be compatible with root ZRAM)
+ZRAM_SWAP_ALGO="lz4"
+
+# Priority for ZRAM swap (higher numbers = higher priority, default swap is usually 0)
+ZRAM_SWAP_PRIORITY=10
+
+# --- Advanced (Usually leave as default) ---
+# ZRAM Device Number (usually 0)
+ZRAM_DEVICE_NUM=0
+
+# Kernel parameter word to trigger ZRAM boot (no '=' needed)
+TRIGGER_PARAMETER="zramroot"
+
+# Seconds to wait for the real root device to appear
+WAIT_TIMEOUT=5
+EOF
+    log_debug "Created default configuration file"
+fi
+
+# Create required directories for mounting
+mkdir -p "${DESTDIR}/zram_root"
+mkdir -p "${DESTDIR}/local_root"
+
+# --- Boot Script ---
+log_hook "Copying main boot script..."
+BOOT_SCRIPT_SOURCE="/usr/share/initramfs-tools/scripts/local-premount/zramroot-boot"
+BOOT_SCRIPT_DEST="${DESTDIR}/scripts/local-premount/zramroot-boot"
+
+if [ -f "${BOOT_SCRIPT_SOURCE}" ]; then
+    # Ensure the target directory exists
+    mkdir -p "${DESTDIR}/scripts/local-premount"
+    # Copy the script and make it executable
+    cp "${BOOT_SCRIPT_SOURCE}" "${BOOT_SCRIPT_DEST}"
+    chmod +x "${BOOT_SCRIPT_DEST}"
+    log_hook "Boot script copied to ${BOOT_SCRIPT_DEST}"
+    
+    # Verify script was copied correctly
+    if [ ! -x "${BOOT_SCRIPT_DEST}" ]; then
+        log_hook "Warning: Boot script may not be executable!"
+        ls -la "${BOOT_SCRIPT_DEST}"
+    fi
+else
+    log_hook "Error: Boot script ${BOOT_SCRIPT_SOURCE} not found!"
+    exit 1
+fi
+
+# --- Verify Local Script ---
+LOCAL_SCRIPT_SOURCE="/usr/share/initramfs-tools/scripts/local"
+LOCAL_SCRIPT_DEST="${DESTDIR}/scripts/local"
+
+if [ -f "${LOCAL_SCRIPT_SOURCE}" ]; then
+    log_hook "Verifying local script..."
+    
+    # Check if local script has zramroot support
+    if grep -q "zramroot" "${LOCAL_SCRIPT_SOURCE}"; then
+        log_hook "Local script has zramroot support"
+    else
+        log_hook "Warning: Local script may not have zramroot support!"
+        # Copy our version if we have one
+        if [ -f "/usr/share/initramfs-tools/scripts/local.zramroot" ]; then
+            log_hook "Using our enhanced local script"
+            cp "/usr/share/initramfs-tools/scripts/local.zramroot" "${LOCAL_SCRIPT_DEST}"
+            chmod +x "${LOCAL_SCRIPT_DEST}"
+        fi
+    fi
+else
+    log_hook "Warning: Cannot verify local script - not found at ${LOCAL_SCRIPT_SOURCE}"
+fi
+
+log_hook "zramroot hook finished successfully."
+exit 0

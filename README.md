@@ -1,8 +1,12 @@
 # zramroot
 
-zramroot is a collection of initramfs scripts for Debian/Ubuntu-based systems that allows your Linux system to operate entirely from RAM. This project is inspired by ramroot for Arch Linux but is designed specifically for initramfs-based Debian and Ubuntu systems.
+zramroot is a collection of init scripts that allows your Linux system to operate entirely from RAM. It supports both **initramfs-tools** (Debian/Ubuntu) and **mkinitcpio** (Arch Linux/Artix/Manjaro) based systems.
 
-By loading the root filesystem into compressed RAM during boot, zramroot allows your system to run without requiring the original storage device after boot completion.
+By loading the root filesystem into compressed ZRAM during boot, zramroot allows your system to run without requiring the original storage device after boot completion. This provides benefits such as:
+- **Faster system performance** - All filesystem operations happen in RAM
+- **Reduced disk wear** - Especially useful for systems running on SD cards or SSDs
+- **Diskless operation** - Physical storage can be disconnected after boot
+- **Privacy** - Changes are stored in RAM and lost on reboot (unless explicitly saved)
 
 ## How It Works
 
@@ -17,7 +21,12 @@ zramroot integrates with your system's initramfs to:
 7. **Adjust system configurations** in the ZRAM root to prevent mounting original partitions
 8. **Switch root** to the ZRAM device and continue booting
 
-This project is currently not finished, you might encounter bugs and end up with a unbootable installation. I would recommend backing up your system before trying to install zramroot. The scripts should work however i have not tested it yet on several different types of system configurations. 
+## Supported Systems
+
+- **Debian/Ubuntu** (and derivatives) - Uses initramfs-tools
+- **Arch Linux/Artix/Manjaro** (and derivatives) - Uses mkinitcpio
+
+**⚠️ Important Warning**: Always backup your system before installing zramroot. While the installation script includes safety measures and backups, improper configuration can result in an unbootable system. The normal boot entry (without zramroot) will remain available as a fallback. 
 
 ## Installation
 
@@ -43,24 +52,51 @@ This project is currently not finished, you might encounter bugs and end up with
 6. Reboot and select the zramroot entry in your bootloader menu
 
 The install script will:
-- Detect your bootloader (GRUB, systemd-boot, or extlinux)
-- Check for required dependencies and packages
-- Ask for additional kernel modules to include and load with the scripts during early boot (if needed)
-- Install all components to the appropriate locations
-- Create a backup of files it replaces
-- Add a new boot entry with the option to load to zram
+- **Auto-detect your init system** (initramfs-tools or mkinitcpio)
+- **Detect your bootloader** (GRUB, systemd-boot, or extlinux)
+- **Check for required dependencies** and suggest installation commands
+- **For Arch/mkinitcpio**: Automatically configure `/etc/mkinitcpio.conf` and rebuild initramfs
+- **For Debian/Ubuntu**: Ask for additional kernel modules if needed
+- **Install all components** to the appropriate locations
+- **Create backups** of files it replaces
+- **Add a new boot entry** with the `zramroot` kernel parameter
 
 ### Manual Installation
 
-If you prefer to install manually, follow these steps:
+#### For Arch Linux / mkinitcpio
 
 1. Copy the files to their respective locations:
    ```bash
-   sudo cp zramroot-boot /usr/share/initramfs-tools/scripts/local-premount/zramroot-boot
-   sudo cp local /usr/share/initramfs-tools/scripts/local
-   sudo cp zramroot /usr/share/initramfs-tools/hooks/zramroot
-   sudo cp zramroot-config /usr/share/initramfs-tools/conf.d/zramroot-config
-   sudo cp zramroot-config /etc/zramroot.conf
+   sudo cp mkinitcpio/hooks/zramroot /usr/lib/initcpio/hooks/zramroot
+   sudo cp mkinitcpio/install/zramroot /usr/lib/initcpio/install/zramroot
+   sudo cp zramroot.conf /etc/zramroot.conf
+   ```
+
+2. Make scripts executable:
+   ```bash
+   sudo chmod +x /usr/lib/initcpio/hooks/zramroot
+   sudo chmod +x /usr/lib/initcpio/install/zramroot
+   ```
+
+3. Edit `/etc/mkinitcpio.conf` and add `zramroot` to the HOOKS array BEFORE `filesystems`:
+   ```bash
+   HOOKS=(base udev autodetect modconf block zramroot filesystems keyboard fsck)
+   ```
+
+4. Rebuild the initramfs:
+   ```bash
+   sudo mkinitcpio -P
+   ```
+
+#### For Debian/Ubuntu / initramfs-tools
+
+1. Copy the files to their respective locations:
+   ```bash
+   sudo cp initramfs-tools/scripts/local-premount/zramroot-boot /usr/share/initramfs-tools/scripts/local-premount/zramroot-boot
+   sudo cp initramfs-tools/scripts/local /usr/share/initramfs-tools/scripts/local
+   sudo cp initramfs-tools/hooks/zramroot /usr/share/initramfs-tools/hooks/zramroot
+   sudo cp initramfs-tools/conf.d/zramroot-config /usr/share/initramfs-tools/conf.d/zramroot-config
+   sudo cp initramfs-tools/conf.d/zramroot-config /etc/zramroot.conf
    ```
 
 2. Make scripts executable:
@@ -70,17 +106,27 @@ If you prefer to install manually, follow these steps:
    sudo chmod +x /usr/share/initramfs-tools/hooks/zramroot
    ```
 
-3. Edit your bootloader configuration to add a zramroot entry:
+3. Rebuild the initramfs:
+   ```bash
+   sudo update-initramfs -u -k all
+   ```
+
+#### Bootloader Configuration (Both Systems)
+
+After installing the files, you need to add a boot entry with the `zramroot` kernel parameter:
 
    **For GRUB:**
    - Create or edit `/etc/grub.d/40_custom` with an entry similar to:
    ```
    menuentry 'Linux (Load Root to ZRAM)' {
      search --no-floppy --fs-uuid --set=root YOUR_ROOT_UUID
-     linux /boot/vmlinuz root=UUID=YOUR_ROOT_UUID rw zramroot
-     initrd /boot/initrd.img
+     linux /boot/vmlinuz-linux root=UUID=YOUR_ROOT_UUID rw zramroot
+     initrd /boot/initramfs-linux.img
    }
    ```
+   - Note: Adjust kernel and initrd paths for your system:
+     - Arch: `/boot/vmlinuz-linux` and `/boot/initramfs-linux.img`
+     - Debian/Ubuntu: `/boot/vmlinuz` and `/boot/initrd.img`
    
    **For systemd-boot:**
    - Create `/boot/loader/entries/zramroot.conf`:
@@ -100,29 +146,35 @@ If you prefer to install manually, follow these steps:
    APPEND root=UUID=YOUR_ROOT_UUID rw zramroot
    INITRD /boot/initrd.img
    ```
-   
    - Replace `YOUR_ROOT_UUID` with your actual root partition UUID (find it with `blkid`)
 
-4. Update your bootloader and rebuild initramfs:
+4. Update your bootloader:
    ```bash
-   # For GRUB:
-   sudo update-grub
-   
+   # For GRUB (all systems):
+   sudo update-grub    # Debian/Ubuntu
+   sudo grub-mkconfig -o /boot/grub/grub.cfg    # Arch
+
    # For systemd-boot:
    sudo bootctl update
-   
+
    # For extlinux:
    sudo extlinux --update /boot/extlinux
-   
-   # Always rebuild initramfs:
-   sudo update-initramfs -c -k all
    ```
 
 ## Configuration
 
-zramroot can be configured by editing `/etc/zramroot.conf`. After making changes, update your initramfs with:
+zramroot can be configured by editing `/etc/zramroot.conf`. The configuration file is shared between both init systems and uses the same format.
+
+After making changes to `/etc/zramroot.conf`, rebuild your initramfs:
+
+**For Arch/mkinitcpio:**
 ```bash
-sudo update-initramfs -c -k all
+sudo mkinitcpio -P
+```
+
+**For Debian/Ubuntu/initramfs-tools:**
+```bash
+sudo update-initramfs -u -k all
 ```
 
 ### Configuration Options
@@ -132,6 +184,8 @@ sudo update-initramfs -c -k all
 DEBUG_MODE="no"
 ```
 Set to "yes" for verbose logging to `/var/log/zramroot-*.log` on the physical hard-drive root partition. All debug logs are exclusively written to the physical storage device, never to the zram device, ensuring logs persist even if zramroot encounters issues.
+
+**Note:** Persistent logging to the physical disk is fully implemented in both initramfs-tools and mkinitcpio versions.
 
 #### ZRAM Device Settings
 ```
@@ -183,11 +237,11 @@ ZRAM_SWAP_PRIORITY=10
 ```
 ZRAM_DEVICE_NUM=0
 TRIGGER_PARAMETER="zramroot"
-WAIT_TIMEOUT=30
+WAIT_TIMEOUT=5
 ```
-- `ZRAM_DEVICE_NUM`: ZRAM device number to use for root
-- `TRIGGER_PARAMETER`: Kernel parameter to activate zramroot
-- `WAIT_TIMEOUT`: Seconds to wait for root device to appear
+- `ZRAM_DEVICE_NUM`: ZRAM device number to use for root (usually 0)
+- `TRIGGER_PARAMETER`: Kernel parameter to activate zramroot (both systems check for this parameter)
+- `WAIT_TIMEOUT`: Seconds to wait for root device to appear (initramfs-tools only)
 
 ## Debugging
 

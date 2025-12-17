@@ -1,0 +1,62 @@
+# Configuration for ZRAM Root Boot with persistent logging
+
+# --- Debugging ---
+# Enable verbose logging to the physical root partition at /var/log/zramroot.log
+DEBUG_MODE="no"
+
+# --- ZRAM Device Settings ---
+# Manually specify ZRAM device size in MiB.
+# If set to 0, size will be calculated automatically.
+ZRAM_SIZE_MiB=0
+
+# Compression algorithm (e.g., lz4, zstd, lzo-rle).
+ZRAM_ALGO="lz4"
+
+# Filesystem type for ZRAM device (e.g., ext4, btrfs, xfs)
+ZRAM_FS_TYPE="ext4"
+
+# Mount options for the ZRAM filesystem
+ZRAM_MOUNT_OPTS="rw,noatime"
+
+# --- RAM Management Settings ---
+# Minimum amount of RAM (in MiB) to leave free after allocating ZRAM
+RAM_MIN_FREE_MiB=512
+
+# Preferred amount of RAM (in MiB) to leave free after allocating ZRAM
+RAM_PREF_FREE_MiB=512
+
+# Minimum ZRAM space (in MiB) to leave free for growth
+ZRAM_MIN_FREE_MiB=256
+
+# Maximum ZRAM space (in MiB) to allocate for growth
+ZRAM_MAX_FREE_MiB=35840
+
+# --- Resource Calculation (Used only if ZRAM_SIZE_MiB is 0) ---
+# Buffer percentage to add to the original used size when calculating ZRAM size automatically.
+ZRAM_BUFFER_PERCENT=10
+
+# --- ZRAM Swap Settings ---
+# Enable ZRAM-based swap to replace original drive swap partitions
+ZRAM_SWAP_ENABLED="yes"
+
+# ZRAM swap device number (usually 1, since 0 is used for root)
+ZRAM_SWAP_DEVICE_NUM=1
+
+# ZRAM swap size in MiB (0 = auto-calculate based on system RAM)
+ZRAM_SWAP_SIZE_MiB=0
+
+# ZRAM swap compression algorithm (should match or be compatible with root ZRAM)
+ZRAM_SWAP_ALGO="lz4"
+
+# Priority for ZRAM swap (higher numbers = higher priority, default swap is usually 0)
+ZRAM_SWAP_PRIORITY=10
+
+# --- Advanced (Usually leave as default) ---
+# ZRAM Device Number (usually 0)
+ZRAM_DEVICE_NUM=0
+
+# Kernel parameter word to trigger ZRAM boot (no '=' needed)
+TRIGGER_PARAMETER="zramroot"
+
+# Seconds to wait for the real root device to appear
+WAIT_TIMEOUT=5
