@@ -36,6 +36,8 @@ build() {
     add_binary sleep
     add_binary date
     add_binary mkswap
+    add_binary timeout
+    add_binary wc
 
     # Add directories
     add_dir /local_root
@@ -48,6 +50,16 @@ build() {
         # Create default config
         cat > "${BUILDROOT}/etc/zramroot.conf" << 'EOF'
 # Configuration for ZRAM Root Boot
+
+# --- Boot Mode Configuration ---
+# Interactive prompt mode: Ask user at boot time whether to use ZRAM
+ZRAM_INTERACTIVE_PROMPT="no"
+
+# Default choice when interactive prompt times out
+ZRAM_DEFAULT_CHOICE="no"
+
+# Timeout in seconds for interactive prompt (0 = wait indefinitely)
+ZRAM_PROMPT_TIMEOUT=10
 
 # --- Debugging ---
 DEBUG_MODE="no"

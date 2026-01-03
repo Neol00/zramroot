@@ -43,10 +43,10 @@ fi
 # --- Binaries needed by the boot script ---
 log_hook "Copying necessary binaries..."
 
-# Core utilities 
+# Core utilities
 copy_bin_list="busybox sh mount umount mkdir rmdir echo cat grep sed df awk rsync cp touch date \
                mountpoint zramctl lsmod modprobe fsck blkid udevadm fuser find tail head ls sync \
-               mkfs.ext4 fsck.ext4"
+               mkfs.ext4 fsck.ext4 timeout du nproc cut sort wc mkswap rm"
 
 for bin in $copy_bin_list; do
     # Try to find the binary in common locations
@@ -280,6 +280,16 @@ else
     # Create default config file
     cat > "${CONFIG_DEST}" << EOF
 # Configuration for ZRAM Root Boot with persistent logging
+
+# --- Boot Mode Configuration ---
+# Interactive prompt mode: Ask user at boot time whether to use ZRAM
+ZRAM_INTERACTIVE_PROMPT="no"
+
+# Default choice when interactive prompt times out
+ZRAM_DEFAULT_CHOICE="no"
+
+# Timeout in seconds for interactive prompt (0 = wait indefinitely)
+ZRAM_PROMPT_TIMEOUT=10
 
 # --- Debugging ---
 # Enable verbose logging to the physical root partition at /var/log/zramroot.log
