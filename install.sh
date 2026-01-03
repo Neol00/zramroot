@@ -558,7 +558,6 @@ backup_file() {
     fi
 }
 
-
 # Install based on init system
 if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
     print_info "Installing for initramfs-tools (Debian/Ubuntu)..."
@@ -760,10 +759,8 @@ else
             echo ""
             print_warning "Supported bootloaders:"
             print_info "  - GRUB (requires /boot/grub/grub.cfg and update-grub command)"
-            print_info "  - systemd-boot (requires /boot/loader/ and bootctl command)"
+            print_info "  - systemd-boot (requires /boot/loader/ and bootctl command)" 
             print_info "  - extlinux/syslinux (requires config files and commands)"
-            echo ""
-            print_info "You can continue with manual bootloader configuration."
             echo ""
             read -p "Continue with manual configuration? (y/n): " continue_manual
             if [[ ! "$continue_manual" =~ ^[Yy]$ ]]; then
@@ -1441,31 +1438,30 @@ elif [ "$bootloader" = "manual" ]; then
     print_info "1. Create a new boot entry that loads the same kernel and initramfs"
     print_info "2. Add 'zramroot' to the kernel command line parameters"
     echo ""
-
+    
     # Get root UUID for manual configuration
     root_uuid=$(grep -oP 'UUID=\K[a-f0-9-]+' /proc/cmdline 2>/dev/null || \
                 grep -oP 'root=UUID=\K[a-f0-9-]+' /proc/cmdline 2>/dev/null || \
                 awk '$2 == "/" {print $1}' /etc/fstab | grep -oP 'UUID=\K[a-f0-9-]+' 2>/dev/null || \
                 blkid -s UUID -o value $(findmnt -no SOURCE /))
-
+    
     print_info "Your root UUID is: ${root_uuid}"
     print_info "Example kernel parameters: root=UUID=${root_uuid} rw zramroot"
     echo ""
 
 elif [ "$bootloader" = "skip" ]; then
     print_info "Bootloader configuration skipped as requested."
-
+    
     # Get root UUID for informational purposes
     root_uuid=$(grep -oP 'UUID=\K[a-f0-9-]+' /proc/cmdline 2>/dev/null || \
                 grep -oP 'root=UUID=\K[a-f0-9-]+' /proc/cmdline 2>/dev/null || \
                 awk '$2 == "/" {print $1}' /etc/fstab | grep -oP 'UUID=\K[a-f0-9-]+' 2>/dev/null || \
                 blkid -s UUID -o value $(findmnt -no SOURCE /))
-
+    
     echo ""
     print_warning "To enable ZRAMroot, you'll need to manually add 'zramroot' to your kernel parameters."
     print_info "Your root UUID is: ${root_uuid}"
     print_info "Example kernel parameters: root=UUID=${root_uuid} rw zramroot"
-    echo ""
 
 fi
 

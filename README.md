@@ -12,37 +12,14 @@ By loading the root filesystem into compressed ZRAM during boot, zramroot allows
 
 zramroot integrates with your system's initramfs to:
 
-1. **Detect the `zramroot` kernel parameter** to determine if ZRAM boot is requested
+1. **Detect the zramroot cmdline kernel parameter** during boot
 2. **Mount your physical root partition** read-write for logging and filesystem copying
 3. **Calculate optimal ZRAM size** based on your configuration and available RAM
 4. **Create and configure a ZRAM device** using your chosen compression algorithm
 5. **Format the ZRAM device** with your selected filesystem
-6. **Copy your entire root filesystem** from physical storage to ZRAM using intelligent parallel operations
+6. **Copy your entire root filesystem** from physical storage to ZRAM
 7. **Adjust system configurations** in the ZRAM root to prevent mounting original partitions
 8. **Switch root** to the ZRAM device and continue booting
-
-To use zramroot, you need to add the `zramroot` kernel parameter to your bootloader configuration. You can create a separate boot entry with this parameter, allowing you to choose between normal boot and ZRAM boot at startup.
-
-## Performance Features
-
-### Intelligent Parallel Copying
-
-zramroot uses an advanced multithreaded copying system that maximizes CPU utilization:
-
-- **Auto-detects optimal thread count** based on CPU cores and available RAM
-- **Dynamic directory splitting**: Large directories (like `/usr/`) are automatically split into subdirectories and distributed across threads
-- **Load balancing**: Work is distributed evenly across all threads to minimize idle time
-- **Smart threshold calculation**: Directories larger than 2× the average are split for parallel processing
-- **Real-time progress monitoring**: Visual progress bar shows active threads and completion percentage
-
-**Example:**
-Instead of one thread copying all of `/usr/` while others sit idle, the system might distribute:
-- Thread 1: `/usr/lib/`
-- Thread 2: `/usr/share/`
-- Thread 3: `/usr/bin/`
-- Thread 4: `/usr/local/` + smaller directories
-
-This results in significantly faster copy times and better resource utilization.
 
 ## Supported Systems
 
@@ -263,7 +240,7 @@ TRIGGER_PARAMETER="zramroot"
 WAIT_TIMEOUT=5
 ```
 - `ZRAM_DEVICE_NUM`: ZRAM device number to use for root (usually 0)
-- `TRIGGER_PARAMETER`: Kernel parameter to activate zramroot
+- `TRIGGER_PARAMETER`: Kernel parameter to activate zramroot (both systems check for this parameter)
 - `WAIT_TIMEOUT`: Seconds to wait for root device to appear (initramfs-tools only)
 
 ## Debugging

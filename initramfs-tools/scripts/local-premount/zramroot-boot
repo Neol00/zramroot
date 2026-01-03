@@ -135,20 +135,20 @@ create_work_distribution() {
     local source="$1"
     local thread_count="$2"
     local work_dir="/tmp/parallel_rsync_work"
-
+    
     log_debug "Creating work distribution for ${thread_count} threads"
-
+    
     # Create temporary directory for work files
     mkdir -p "$work_dir"
-    rm -f "${work_dir}/job_"* "${work_dir}/"*.list* 2>/dev/null
-
-    local dir_list="${work_dir}/directories.list"
-    local work_items="${work_dir}/work_items.list"
-
+    rm -f "${work_dir}/job_"*
+    
     # Get top-level directories and their sizes
     log_debug "Analyzing directory structure..."
-
-    # Scan top-level directories
+    
+    # Create list of directories with sizes (in KB)
+    local dir_list="${work_dir}/directories.list"
+    
+    # Get subdirectories of source, excluding special directories
     find "$source" -maxdepth 1 -type d ! -path "$source" \
         ! -name "dev" ! -name "proc" ! -name "sys" ! -name "tmp" \
         ! -name "run" ! -name "mnt" ! -name "media" ! -name "lost+found" \
@@ -159,55 +159,25 @@ create_work_distribution() {
             echo "${size_kb}:${dir_name}" >> "$dir_list"
         fi
     done
-
-    # Calculate total size and threshold for splitting
-    local total_kb=$(awk -F: '{sum+=$1} END{print sum}' "$dir_list")
-    local avg_per_thread=$((total_kb / thread_count))
-    local split_threshold=$((avg_per_thread * 2))  # Split dirs larger than 2x average
-
-    log_debug "Total size: $((total_kb / 1024))MB, split threshold: $((split_threshold / 1024))MB"
-
-    # Process each directory - split large ones, keep small ones whole
-    while IFS=: read size_kb dir_name; do
-        if [ "$size_kb" -gt "$split_threshold" ]; then
-            # Large directory - split into subdirectories
-            log_debug "Splitting large directory: ${dir_name} ($((size_kb / 1024))MB)"
-
-            find "${source}/${dir_name}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read subdir; do
-                local sub_size=$(du -sk "$subdir" 2>/dev/null | awk '{print $1}' || echo "0")
-                local sub_name=$(echo "$subdir" | sed "s|^${source}/||")
-                if [ "$sub_size" -gt 0 ]; then
-                    echo "${sub_size}:SUBDIR:${sub_name}" >> "$work_items"
-                fi
-            done
-
-            # Also add any files directly in this directory
-            local files_size=$(find "${source}/${dir_name}" -maxdepth 1 -type f -o -maxdepth 1 -type l 2>/dev/null | \
-                              xargs du -sk 2>/dev/null | awk '{sum+=$1} END{print sum}' || echo "0")
-            if [ -n "$files_size" ] && [ "$files_size" -gt 0 ]; then
-                echo "${files_size}:FILES:${dir_name}" >> "$work_items"
-            fi
-        else
-            # Small directory - keep whole
-            echo "${size_kb}:DIR:${dir_name}" >> "$work_items"
-        fi
-    done < "$dir_list"
-
-    # Add root files as a work item
-    echo "0:ROOT:." >> "$work_items"
-
-    # Sort work items by size (largest first)
-    sort -rn -t: -k1 "$work_items" > "${work_items}.sorted"
-
-    # Initialize job files
+    
+    # Sort directories by size (largest first) for better load balancing
+    sort -rn -t: -k1 "$dir_list" > "${dir_list}.sorted"
+    
+    # Distribute directories across job files using round-robin with load balancing
+    local job_index=0
+    
+    # Initialize job size trackers and job lists
     for i in $(seq 0 $((thread_count - 1))); do
         echo "0" > "${work_dir}/job_${i}.size"
         touch "${work_dir}/job_${i}.list"
     done
-
-    # Distribute work items to jobs using load balancing
-    while IFS=: read size_kb item_type item_path; do
-        if [ -n "$item_path" ]; then
+    
+    # Distribute directories to jobs, always picking the job with least total size
+    while read line; do
+        if [ -n "$line" ]; then
+            local size=$(echo "$line" | cut -d: -f1)
+            local dir_name=$(echo "$line" | cut -d: -f2)
+            
             # Find job with minimum current size
             local min_job=0
             local min_size=$(cat "${work_dir}/job_0.size")
@@ -218,24 +188,27 @@ create_work_distribution() {
                     min_job=$i
                 fi
             done
-
-            # Add work item to the job with minimum size
-            echo "${item_type}:${item_path}" >> "${work_dir}/job_${min_job}.list"
-            local new_size=$((min_size + size_kb))
+            
+            # Add directory to the job with minimum size
+            echo "$dir_name" >> "${work_dir}/job_${min_job}.list"
+            local new_size=$((min_size + size))
             echo "$new_size" > "${work_dir}/job_${min_job}.size"
-
-            log_debug "Assigned ${item_type} ${item_path} ($((size_kb / 1024))MB) to job ${min_job}"
+            
+            log_debug "Assigned ${dir_name} (${size}KB) to job ${min_job}"
         fi
-    done < "${work_items}.sorted"
-
-    # Log final job distribution
+    done < "${dir_list}.sorted"
+    
+    # Add any remaining files in root directory to job 0
+    echo "ROOT_FILES" >> "${work_dir}/job_0.list"
+    
+    # Log job distribution
     for i in $(seq 0 $((thread_count - 1))); do
         local job_size_kb=$(cat "${work_dir}/job_${i}.size")
         local job_size_mb=$((job_size_kb / 1024))
-        local item_count=$(wc -l < "${work_dir}/job_${i}.list")
-        log_debug "Job ${i}: ${item_count} items, ~${job_size_mb}MB"
+        local dir_count=$(wc -l < "${work_dir}/job_${i}.list")
+        log_debug "Job ${i}: ${dir_count} items, ~${job_size_mb}MB"
     done
-
+    
     echo "$work_dir"
 }
 
@@ -289,37 +262,21 @@ copy_with_parallel_progress() {
         if [ -s "$job_file" ]; then
             # Start rsync job in background
             (
-                # Process each work item in this job
-                while IFS=: read item_type item_path; do
-                    case "$item_type" in
-                        ROOT)
-                            # Copy root level files and symlinks only
-                            rsync -ax \
-                                  --include="/*" --exclude="/*/" \
-                                  --exclude="/dev" --exclude="/proc" --exclude="/sys" --exclude="/tmp" \
-                                  --exclude="/run" --exclude="/mnt" --exclude="/media" --exclude="/lost+found" \
-                                  "${source}/" "${dest}/" 2>>"$job_log"
-                            ;;
-                        DIR)
-                            # Copy entire directory
-                            mkdir -p "${dest}/${item_path}"
-                            rsync -ax --delete \
-                                  "${source}/${item_path}/" "${dest}/${item_path}/" 2>>"$job_log"
-                            ;;
-                        SUBDIR)
-                            # Copy subdirectory (path already includes parent)
-                            mkdir -p "${dest}/${item_path}"
-                            rsync -ax --delete \
-                                  "${source}/${item_path}/" "${dest}/${item_path}/" 2>>"$job_log"
-                            ;;
-                        FILES)
-                            # Copy only files from this directory (not subdirs)
-                            mkdir -p "${dest}/${item_path}"
-                            rsync -ax \
-                                  --include="/*" --exclude="/*/" \
-                                  "${source}/${item_path}/" "${dest}/${item_path}/" 2>>"$job_log"
-                            ;;
-                    esac
+                # Process each directory/file in this job
+                while read item; do
+                    if [ "$item" = "ROOT_FILES" ]; then
+                        # Copy root level files and symlinks (excluding directories that are handled separately)
+                        rsync -ax \
+                              --include="/*" --exclude="/*/" \
+                              --exclude="/dev" --exclude="/proc" --exclude="/sys" --exclude="/tmp" \
+                              --exclude="/run" --exclude="/mnt" --exclude="/media" --exclude="/lost+found" \
+                              "${source}/" "${dest}/" 2>>"$job_log"
+                    else
+                        # Copy specific directory
+                        mkdir -p "${dest}/${item}"
+                        rsync -ax --delete \
+                              "${source}/${item}/" "${dest}/${item}/" 2>>"$job_log"
+                    fi
                 done < "$job_file"
             ) &
             
@@ -524,93 +481,32 @@ setup_zram_swap() {
     fi
 }
 
-# Load configuration
-if [ -f "${CONFIG_FILE}" ]; then
-    log_debug "Loading configuration from ${CONFIG_FILE}"
-    . "${CONFIG_FILE}"
-    log_debug "Configuration loaded"
-fi
-
-# --- Determine if we should boot with ZRAM ---
-# Only boot with ZRAM if the kernel parameter is present
-USE_ZRAM=0
-
-# Try to mount physical root EARLY for logging if debug mode is enabled
-if [ "${DEBUG_MODE}" = "yes" ]; then
-    REAL_ROOT_DEVICE="${ROOT}"
-    if [ -n "${REAL_ROOT_DEVICE}" ]; then
-        log_kernel "DEBUG: Attempting early mount of physical root for logging"
-        mkdir -p "${REAL_ROOT_MNT}"
-
-        # Wait a bit for device to be ready
-        sleep 2
-
-        # Try to find the real device
-        real_dev=""
-
-        # First try resolving UUID/LABEL style devices
-        if echo "${REAL_ROOT_DEVICE}" | grep -q "^UUID=\|^LABEL="; then
-            if command -v blkid >/dev/null 2>&1; then
-                real_dev=$(blkid -l -t "${REAL_ROOT_DEVICE}" -o device 2>/dev/null)
-                log_kernel "DEBUG: Resolved ${REAL_ROOT_DEVICE} to ${real_dev}"
-            fi
-        # Handle direct device paths
-        elif [ "${REAL_ROOT_DEVICE#/dev/}" != "${REAL_ROOT_DEVICE}" ] && [ -b "${REAL_ROOT_DEVICE}" ]; then
-            real_dev="${REAL_ROOT_DEVICE}"
-            log_kernel "DEBUG: Using direct device path: ${real_dev}"
-        fi
-
-        if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
-            if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
-                # Ensure log directory exists
-                mkdir -p "${REAL_ROOT_LOG_DIR}"
-                # Create/touch the log file to ensure it's writable
-                touch "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
-                log_debug "Early mount successful - debug logs will be written to ${REAL_ROOT_LOG_FILE}"
-            fi
-        fi
-    fi
-fi
-
-# Check for zramroot kernel parameter
+# Check if zramroot parameter is in cmdline before doing anything
 log_kernel "Checking for zramroot parameter in kernel cmdline"
-log_debug "Checking kernel cmdline for 'zramroot' parameter"
-if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
-    USE_ZRAM=1
-    log_kernel "zramroot parameter found - starting setup"
-    log_debug "Kernel parameter 'zramroot' found in cmdline"
-else
+if ! echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
     log_debug "No zramroot parameter found - exiting quietly"
-
-    # Cleanup - unmount early debug mount if it was mounted
-    if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
-        log_debug "Unmounting early debug mount"
-        sync
-        umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
-    fi
     exit 0
 fi
 
-# If we get here, USE_ZRAM=1, so proceed with ZRAM setup
-log_kernel "Starting ZRAM root setup"
+log_kernel "zramroot parameter found - starting setup"
 
 # Create necessary directories
 mkdir -p /mnt
 mkdir -p /tmp
 mkdir -p "${ZRAM_TEMP_MNT}"
 
-# Try to mount physical root for logging and file copying (if not already mounted in debug mode)
+# Try to mount physical root for logging and file copying
 REAL_ROOT_DEVICE="${ROOT}"
-if [ -n "${REAL_ROOT_DEVICE}" ] && ! mountpoint -q "${REAL_ROOT_MNT}"; then
-    log_debug "Attempting to mount physical root ${REAL_ROOT_DEVICE} for copying"
+if [ -n "${REAL_ROOT_DEVICE}" ]; then
+    log_debug "Attempting to mount physical root ${REAL_ROOT_DEVICE} for logging and copying"
     mkdir -p "${REAL_ROOT_MNT}"
-
+    
     # Wait a bit for device to be ready
     sleep 2
-
+    
     # Try to find the real device
     real_dev=""
-
+    
     # First try resolving UUID/LABEL style devices
     if echo "${REAL_ROOT_DEVICE}" | grep -q "^UUID=\|^LABEL="; then
         if command -v blkid >/dev/null 2>&1; then
@@ -622,7 +518,7 @@ if [ -n "${REAL_ROOT_DEVICE}" ] && ! mountpoint -q "${REAL_ROOT_MNT}"; then
         real_dev="${REAL_ROOT_DEVICE}"
         log_debug "Using direct device path: ${real_dev}"
     fi
-
+    
     if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
         log_debug "Attempting to mount ${real_dev} at ${REAL_ROOT_MNT}"
         if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
@@ -638,32 +534,23 @@ if [ -n "${REAL_ROOT_DEVICE}" ] && ! mountpoint -q "${REAL_ROOT_MNT}"; then
     else
         log_error "Could not find physical root device: ${REAL_ROOT_DEVICE}"
     fi
-elif mountpoint -q "${REAL_ROOT_MNT}"; then
-    log_debug "Physical root already mounted at ${REAL_ROOT_MNT}"
 fi
 
-# Set remaining default values (main config already loaded earlier)
-DEBUG_MODE="${DEBUG_MODE:-no}"
-ZRAM_SIZE_MiB="${ZRAM_SIZE_MiB:-0}"
-ZRAM_ALGO="${ZRAM_ALGO:-zstd}"
-ZRAM_FS_TYPE="${ZRAM_FS_TYPE:-ext4}"
-ZRAM_MOUNT_OPTS="${ZRAM_MOUNT_OPTS:-defaults,noatime}"
-RAM_MIN_FREE_MiB="${RAM_MIN_FREE_MiB:-512}"
-ZRAM_BUFFER_PERCENT="${ZRAM_BUFFER_PERCENT:-10}"
-ZRAM_DEVICE_NUM="${ZRAM_DEVICE_NUM:-0}"
-TRIGGER_PARAMETER="${TRIGGER_PARAMETER:-zramroot}"
-WAIT_TIMEOUT="${WAIT_TIMEOUT:-5}"
-RAM_PREF_FREE_MiB="${RAM_PREF_FREE_MiB:-1024}"
-ZRAM_MIN_FREE_MiB="${ZRAM_MIN_FREE_MiB:-256}"
-ZRAM_MAX_FREE_MiB="${ZRAM_MAX_FREE_MiB:-35840}"
+# Load configuration
+DEBUG_MODE="no"; ZRAM_SIZE_MiB=0; ZRAM_ALGO="zstd"; ZRAM_FS_TYPE="ext4"
+ZRAM_MOUNT_OPTS="defaults,noatime"; RAM_MIN_FREE_MiB=512
+ZRAM_BUFFER_PERCENT=10
+ZRAM_DEVICE_NUM=0; TRIGGER_PARAMETER="zramroot"; WAIT_TIMEOUT=5
+RAM_PREF_FREE_MiB=1024; ZRAM_MIN_FREE_MiB=256; ZRAM_MAX_FREE_MiB=35840
 # ZRAM Swap defaults
-ZRAM_SWAP_ENABLED="${ZRAM_SWAP_ENABLED:-yes}"
-ZRAM_SWAP_DEVICE_NUM="${ZRAM_SWAP_DEVICE_NUM:-1}"
-ZRAM_SWAP_SIZE_MiB="${ZRAM_SWAP_SIZE_MiB:-0}"
-ZRAM_SWAP_ALGO="${ZRAM_SWAP_ALGO:-lz4}"
-ZRAM_SWAP_PRIORITY="${ZRAM_SWAP_PRIORITY:-10}"
+ZRAM_SWAP_ENABLED="yes"; ZRAM_SWAP_DEVICE_NUM=1; ZRAM_SWAP_SIZE_MiB=0
+ZRAM_SWAP_ALGO="lz4"; ZRAM_SWAP_PRIORITY=10
 
-log_debug "Configuration loaded - DEBUG_MODE=${DEBUG_MODE}"
+if [ -f "${CONFIG_FILE}" ]; then
+    log_debug "Loading configuration from ${CONFIG_FILE}"
+    . "${CONFIG_FILE}"
+    log_debug "Configuration loaded - DEBUG_MODE=${DEBUG_MODE}"
+fi
 
 # Set algorithm-specific compression estimates based on empirical testing
 # These are not user-configurable as ZRAM doesn't allow tuning compression levels

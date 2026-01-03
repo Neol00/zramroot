@@ -1,10 +1,7 @@
-# Configuration for ZRAM Root Boot
-# This configuration file works with both initramfs-tools (Debian/Ubuntu)
-# and mkinitcpio (Arch Linux) implementations
+# Configuration for ZRAM Root Boot with persistent logging
 
 # --- Debugging ---
-# Enable verbose logging to /var/log/zramroot-*.log
-# Logs are written to the physical root partition and persist after boot
+# Enable verbose logging to the physical root partition at /var/log/zramroot.log
 DEBUG_MODE="no"
 
 # --- ZRAM Device Settings ---
@@ -58,10 +55,8 @@ ZRAM_SWAP_PRIORITY=10
 # ZRAM Device Number (usually 0)
 ZRAM_DEVICE_NUM=0
 
-# Kernel parameter word to trigger ZRAM boot
-# Add this parameter to your kernel command line to boot with ZRAM
-# Example: Add "zramroot" to GRUB_CMDLINE_LINUX in /etc/default/grub
+# Kernel parameter word to trigger ZRAM boot (no '=' needed)
 TRIGGER_PARAMETER="zramroot"
 
-# Seconds to wait for the real root device to appear (initramfs-tools only)
+# Seconds to wait for the real root device to appear
 WAIT_TIMEOUT=5
