@@ -12,7 +12,7 @@ By loading the root filesystem into compressed ZRAM during boot, zramroot allows
 
 zramroot integrates with your system's initramfs to:
 
-1. **Detect whether to use ZRAM** - Either via the `zramroot` kernel parameter OR interactive prompt (your choice)
+1. **Detect the `zramroot` kernel parameter** to determine if ZRAM boot is requested
 2. **Mount your physical root partition** read-write for logging and filesystem copying
 3. **Calculate optimal ZRAM size** based on your configuration and available RAM
 4. **Create and configure a ZRAM device** using your chosen compression algorithm
@@ -21,23 +21,7 @@ zramroot integrates with your system's initramfs to:
 7. **Adjust system configurations** in the ZRAM root to prevent mounting original partitions
 8. **Switch root** to the ZRAM device and continue booting
 
-### Boot Modes
-
-zramroot supports two different boot modes:
-
-#### 1. Kernel Parameter Mode (Default)
-- Traditional method requiring the `zramroot` kernel parameter
-- Create a separate bootloader entry with `zramroot` added to kernel parameters
-- Only boots with ZRAM when you explicitly select that boot entry
-
-#### 2. Interactive Prompt Mode (New!)
-- Shows a prompt during every boot: "Boot with ZRAM? [y/N]"
-- Press 'y' to boot with ZRAM, 'n' or wait for timeout to boot normally
-- No kernel parameter needed - works with your existing boot entry
-- Configurable timeout and default choice
-- Perfect for systems where bootloader configuration is difficult or unavailable
-
-You can enable interactive mode by setting `ZRAM_INTERACTIVE_PROMPT="yes"` in `/etc/zramroot.conf`
+To use zramroot, you need to add the `zramroot` kernel parameter to your bootloader configuration. You can create a separate boot entry with this parameter, allowing you to choose between normal boot and ZRAM boot at startup.
 
 ## Performance Features
 
@@ -99,7 +83,6 @@ The install script will:
 - **Install all components** to the appropriate locations
 - **Create backups** of files it replaces
 - **Add a new boot entry** with the `zramroot` kernel parameter
-- **If bootloader configuration fails**: Offer to enable interactive prompt mode instead
 
 ### Manual Installation
 
@@ -219,33 +202,6 @@ sudo update-initramfs -u -k all
 
 ### Configuration Options
 
-#### Boot Mode Configuration
-```
-ZRAM_INTERACTIVE_PROMPT="no"
-ZRAM_DEFAULT_CHOICE="no"
-ZRAM_PROMPT_TIMEOUT=10
-```
-- `ZRAM_INTERACTIVE_PROMPT`: Enable interactive boot prompt (options: "yes" or "no")
-  - "no" (default): Only boot with ZRAM if kernel parameter is present
-  - "yes": Always show interactive prompt asking to boot with ZRAM
-- `ZRAM_DEFAULT_CHOICE`: Default choice when prompt times out (options: "yes" or "no")
-  - "yes": Boot with ZRAM by default (user must press 'n' to skip)
-  - "no" (default): Boot normally by default (user must press 'y' to use ZRAM)
-- `ZRAM_PROMPT_TIMEOUT`: Timeout in seconds for interactive prompt (0 = wait indefinitely)
-
-**Example Interactive Prompt:**
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                  ZRAM Root Boot Configuration
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Boot with ZRAM (copy root filesystem to RAM)? [y/N]
-  Default: NO
-  Timeout: 10 seconds
-
-  Choice: _
-```
-
 #### Debugging
 ```
 DEBUG_MODE="no"
@@ -307,7 +263,7 @@ TRIGGER_PARAMETER="zramroot"
 WAIT_TIMEOUT=5
 ```
 - `ZRAM_DEVICE_NUM`: ZRAM device number to use for root (usually 0)
-- `TRIGGER_PARAMETER`: Kernel parameter to activate zramroot (both systems check for this parameter)
+- `TRIGGER_PARAMETER`: Kernel parameter to activate zramroot
 - `WAIT_TIMEOUT`: Seconds to wait for root device to appear (initramfs-tools only)
 
 ## Debugging

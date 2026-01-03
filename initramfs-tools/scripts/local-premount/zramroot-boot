@@ -524,111 +524,18 @@ setup_zram_swap() {
     fi
 }
 
-# Load configuration EARLY (before checking kernel parameter or showing prompt)
-ZRAM_INTERACTIVE_PROMPT="no"
-ZRAM_DEFAULT_CHOICE="no"
-ZRAM_PROMPT_TIMEOUT=10
-
+# Load configuration
 if [ -f "${CONFIG_FILE}" ]; then
     log_debug "Loading configuration from ${CONFIG_FILE}"
     . "${CONFIG_FILE}"
-    log_debug "Early configuration loaded"
+    log_debug "Configuration loaded"
 fi
 
-# --- Interactive Prompt Function ---
-prompt_user_for_zram() {
-    local timeout="${ZRAM_PROMPT_TIMEOUT}"
-    local default="${ZRAM_DEFAULT_CHOICE}"
-
-    # Hide Plymouth splash screen if it's running
-    if [ -x /bin/plymouth ] && plymouth --ping 2>/dev/null; then
-        plymouth hide-splash 2>/dev/null || true
-    fi
-
-    # Ensure output goes to the active console
-    exec </dev/console >/dev/console 2>/dev/console
-
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "                      ZRAM Root Boot Configuration"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-
-    if [ "$default" = "yes" ]; then
-        echo "  Boot with ZRAM (copy root filesystem to RAM)? [Y/n]"
-        echo "  Default: YES"
-    else
-        echo "  Boot with ZRAM (copy root filesystem to RAM)? [y/N]"
-        echo "  Default: NO"
-    fi
-
-    if [ "$timeout" -gt 0 ]; then
-        echo "  Timeout: ${timeout} seconds"
-    fi
-
-    echo ""
-    echo -n "  Choice: "
-
-    # Read user input with timeout - read directly from console
-    local choice=""
-    if [ "$timeout" -eq 0 ]; then
-        # No timeout - wait indefinitely
-        read choice </dev/console
-    else
-        # Use timeout and read from console
-        choice=$(timeout "$timeout" sh -c 'read choice </dev/console; echo "$choice"' 2>/dev/null || echo "")
-    fi
-
-    # Process choice
-    choice=$(echo "$choice" | tr '[:upper:]' '[:lower:]')
-
-    local result=1
-
-    if [ -z "$choice" ]; then
-        # No input - use default
-        echo ""
-        echo "  Using default: $default"
-        echo ""
-        if [ "$default" = "yes" ]; then
-            result=0
-        else
-            result=1
-        fi
-    elif [ "$choice" = "y" ] || [ "$choice" = "yes" ]; then
-        echo ""
-        echo "  Booting with ZRAM..."
-        echo ""
-        result=0
-    elif [ "$choice" = "n" ] || [ "$choice" = "no" ]; then
-        echo ""
-        echo "  Skipping ZRAM, booting normally..."
-        echo ""
-        result=1
-    else
-        # Invalid input - use default
-        echo ""
-        echo "  Invalid input. Using default: $default"
-        echo ""
-        if [ "$default" = "yes" ]; then
-            result=0
-        else
-            result=1
-        fi
-    fi
-
-    # Show Plymouth splash screen again if it was running
-    if [ -x /bin/plymouth ] && plymouth --ping 2>/dev/null; then
-        plymouth show-splash 2>/dev/null || true
-    fi
-
-    return $result
-}
-
 # --- Determine if we should boot with ZRAM ---
+# Only boot with ZRAM if the kernel parameter is present
 USE_ZRAM=0
 
 # Try to mount physical root EARLY for logging if debug mode is enabled
-# This needs to happen before the prompt so debug logs can be written to disk
 if [ "${DEBUG_MODE}" = "yes" ]; then
     REAL_ROOT_DEVICE="${ROOT}"
     if [ -n "${REAL_ROOT_DEVICE}" ]; then
@@ -665,45 +572,23 @@ if [ "${DEBUG_MODE}" = "yes" ]; then
     fi
 fi
 
-if [ "${ZRAM_INTERACTIVE_PROMPT}" = "yes" ]; then
-    # Interactive mode - always prompt user
-    log_kernel "Interactive prompt mode enabled - asking user"
-    log_debug "Showing interactive prompt with timeout=${ZRAM_PROMPT_TIMEOUT}, default=${ZRAM_DEFAULT_CHOICE}"
-    if prompt_user_for_zram; then
-        USE_ZRAM=1
-        log_kernel "User chose to boot with ZRAM"
-        log_debug "Interactive prompt returned: boot with ZRAM"
-    else
-        log_kernel "User chose normal boot - exiting"
-        log_debug "Interactive prompt returned: normal boot (no ZRAM)"
-
-        # Cleanup - unmount early debug mount if it was mounted
-        if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
-            log_debug "Unmounting early debug mount"
-            sync
-            umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
-        fi
-        exit 0
-    fi
+# Check for zramroot kernel parameter
+log_kernel "Checking for zramroot parameter in kernel cmdline"
+log_debug "Checking kernel cmdline for 'zramroot' parameter"
+if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
+    USE_ZRAM=1
+    log_kernel "zramroot parameter found - starting setup"
+    log_debug "Kernel parameter 'zramroot' found in cmdline"
 else
-    # Kernel parameter mode - check for zramroot parameter
-    log_kernel "Checking for zramroot parameter in kernel cmdline"
-    log_debug "Interactive prompt disabled, checking kernel cmdline for 'zramroot'"
-    if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
-        USE_ZRAM=1
-        log_kernel "zramroot parameter found - starting setup"
-        log_debug "Kernel parameter 'zramroot' found in cmdline"
-    else
-        log_debug "No zramroot parameter found - exiting quietly"
+    log_debug "No zramroot parameter found - exiting quietly"
 
-        # Cleanup - unmount early debug mount if it was mounted
-        if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
-            log_debug "Unmounting early debug mount"
-            sync
-            umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
-        fi
-        exit 0
+    # Cleanup - unmount early debug mount if it was mounted
+    if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
+        log_debug "Unmounting early debug mount"
+        sync
+        umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
     fi
+    exit 0
 fi
 
 # If we get here, USE_ZRAM=1, so proceed with ZRAM setup
