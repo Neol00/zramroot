@@ -540,6 +540,14 @@ prompt_user_for_zram() {
     local timeout="${ZRAM_PROMPT_TIMEOUT}"
     local default="${ZRAM_DEFAULT_CHOICE}"
 
+    # Hide Plymouth splash screen if it's running
+    if [ -x /bin/plymouth ] && plymouth --ping 2>/dev/null; then
+        plymouth hide-splash 2>/dev/null || true
+    fi
+
+    # Ensure output goes to the active console
+    exec </dev/console >/dev/console 2>/dev/console
+
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "                      ZRAM Root Boot Configuration"
@@ -561,18 +569,20 @@ prompt_user_for_zram() {
     echo ""
     echo -n "  Choice: "
 
-    # Read user input with timeout
+    # Read user input with timeout - read directly from console
     local choice=""
     if [ "$timeout" -eq 0 ]; then
         # No timeout - wait indefinitely
-        read choice
+        read choice </dev/console
     else
-        # Use timeout
-        choice=$(timeout "$timeout" sh -c 'read choice; echo "$choice"' 2>/dev/null || echo "")
+        # Use timeout and read from console
+        choice=$(timeout "$timeout" sh -c 'read choice </dev/console; echo "$choice"' 2>/dev/null || echo "")
     fi
 
     # Process choice
     choice=$(echo "$choice" | tr '[:upper:]' '[:lower:]')
+
+    local result=1
 
     if [ -z "$choice" ]; then
         # No input - use default
@@ -580,54 +590,118 @@ prompt_user_for_zram() {
         echo "  Using default: $default"
         echo ""
         if [ "$default" = "yes" ]; then
-            return 0
+            result=0
         else
-            return 1
+            result=1
         fi
     elif [ "$choice" = "y" ] || [ "$choice" = "yes" ]; then
         echo ""
         echo "  Booting with ZRAM..."
         echo ""
-        return 0
+        result=0
     elif [ "$choice" = "n" ] || [ "$choice" = "no" ]; then
         echo ""
         echo "  Skipping ZRAM, booting normally..."
         echo ""
-        return 1
+        result=1
     else
         # Invalid input - use default
         echo ""
         echo "  Invalid input. Using default: $default"
         echo ""
         if [ "$default" = "yes" ]; then
-            return 0
+            result=0
         else
-            return 1
+            result=1
         fi
     fi
+
+    # Show Plymouth splash screen again if it was running
+    if [ -x /bin/plymouth ] && plymouth --ping 2>/dev/null; then
+        plymouth show-splash 2>/dev/null || true
+    fi
+
+    return $result
 }
 
 # --- Determine if we should boot with ZRAM ---
 USE_ZRAM=0
 
+# Try to mount physical root EARLY for logging if debug mode is enabled
+# This needs to happen before the prompt so debug logs can be written to disk
+if [ "${DEBUG_MODE}" = "yes" ]; then
+    REAL_ROOT_DEVICE="${ROOT}"
+    if [ -n "${REAL_ROOT_DEVICE}" ]; then
+        log_kernel "DEBUG: Attempting early mount of physical root for logging"
+        mkdir -p "${REAL_ROOT_MNT}"
+
+        # Wait a bit for device to be ready
+        sleep 2
+
+        # Try to find the real device
+        real_dev=""
+
+        # First try resolving UUID/LABEL style devices
+        if echo "${REAL_ROOT_DEVICE}" | grep -q "^UUID=\|^LABEL="; then
+            if command -v blkid >/dev/null 2>&1; then
+                real_dev=$(blkid -l -t "${REAL_ROOT_DEVICE}" -o device 2>/dev/null)
+                log_kernel "DEBUG: Resolved ${REAL_ROOT_DEVICE} to ${real_dev}"
+            fi
+        # Handle direct device paths
+        elif [ "${REAL_ROOT_DEVICE#/dev/}" != "${REAL_ROOT_DEVICE}" ] && [ -b "${REAL_ROOT_DEVICE}" ]; then
+            real_dev="${REAL_ROOT_DEVICE}"
+            log_kernel "DEBUG: Using direct device path: ${real_dev}"
+        fi
+
+        if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
+            if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
+                # Ensure log directory exists
+                mkdir -p "${REAL_ROOT_LOG_DIR}"
+                # Create/touch the log file to ensure it's writable
+                touch "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+                log_debug "Early mount successful - debug logs will be written to ${REAL_ROOT_LOG_FILE}"
+            fi
+        fi
+    fi
+fi
+
 if [ "${ZRAM_INTERACTIVE_PROMPT}" = "yes" ]; then
     # Interactive mode - always prompt user
     log_kernel "Interactive prompt mode enabled - asking user"
+    log_debug "Showing interactive prompt with timeout=${ZRAM_PROMPT_TIMEOUT}, default=${ZRAM_DEFAULT_CHOICE}"
     if prompt_user_for_zram; then
         USE_ZRAM=1
         log_kernel "User chose to boot with ZRAM"
+        log_debug "Interactive prompt returned: boot with ZRAM"
     else
         log_kernel "User chose normal boot - exiting"
+        log_debug "Interactive prompt returned: normal boot (no ZRAM)"
+
+        # Cleanup - unmount early debug mount if it was mounted
+        if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
+            log_debug "Unmounting early debug mount"
+            sync
+            umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
+        fi
         exit 0
     fi
 else
     # Kernel parameter mode - check for zramroot parameter
     log_kernel "Checking for zramroot parameter in kernel cmdline"
+    log_debug "Interactive prompt disabled, checking kernel cmdline for 'zramroot'"
     if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
         USE_ZRAM=1
         log_kernel "zramroot parameter found - starting setup"
+        log_debug "Kernel parameter 'zramroot' found in cmdline"
     else
         log_debug "No zramroot parameter found - exiting quietly"
+
+        # Cleanup - unmount early debug mount if it was mounted
+        if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
+            log_debug "Unmounting early debug mount"
+            sync
+            umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
+        fi
         exit 0
     fi
 fi
@@ -640,18 +714,18 @@ mkdir -p /mnt
 mkdir -p /tmp
 mkdir -p "${ZRAM_TEMP_MNT}"
 
-# Try to mount physical root for logging and file copying
+# Try to mount physical root for logging and file copying (if not already mounted in debug mode)
 REAL_ROOT_DEVICE="${ROOT}"
-if [ -n "${REAL_ROOT_DEVICE}" ]; then
-    log_debug "Attempting to mount physical root ${REAL_ROOT_DEVICE} for logging and copying"
+if [ -n "${REAL_ROOT_DEVICE}" ] && ! mountpoint -q "${REAL_ROOT_MNT}"; then
+    log_debug "Attempting to mount physical root ${REAL_ROOT_DEVICE} for copying"
     mkdir -p "${REAL_ROOT_MNT}"
-    
+
     # Wait a bit for device to be ready
     sleep 2
-    
+
     # Try to find the real device
     real_dev=""
-    
+
     # First try resolving UUID/LABEL style devices
     if echo "${REAL_ROOT_DEVICE}" | grep -q "^UUID=\|^LABEL="; then
         if command -v blkid >/dev/null 2>&1; then
@@ -663,7 +737,7 @@ if [ -n "${REAL_ROOT_DEVICE}" ]; then
         real_dev="${REAL_ROOT_DEVICE}"
         log_debug "Using direct device path: ${real_dev}"
     fi
-    
+
     if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
         log_debug "Attempting to mount ${real_dev} at ${REAL_ROOT_MNT}"
         if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
@@ -679,6 +753,8 @@ if [ -n "${REAL_ROOT_DEVICE}" ]; then
     else
         log_error "Could not find physical root device: ${REAL_ROOT_DEVICE}"
     fi
+elif mountpoint -q "${REAL_ROOT_MNT}"; then
+    log_debug "Physical root already mounted at ${REAL_ROOT_MNT}"
 fi
 
 # Set remaining default values (main config already loaded earlier)
