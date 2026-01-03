@@ -12,14 +12,53 @@ By loading the root filesystem into compressed ZRAM during boot, zramroot allows
 
 zramroot integrates with your system's initramfs to:
 
-1. **Detect the zramroot cmdline kernel parameter** during boot
+1. **Detect whether to use ZRAM** - Either via the `zramroot` kernel parameter OR interactive prompt (your choice)
 2. **Mount your physical root partition** read-write for logging and filesystem copying
 3. **Calculate optimal ZRAM size** based on your configuration and available RAM
 4. **Create and configure a ZRAM device** using your chosen compression algorithm
 5. **Format the ZRAM device** with your selected filesystem
-6. **Copy your entire root filesystem** from physical storage to ZRAM
+6. **Copy your entire root filesystem** from physical storage to ZRAM using intelligent parallel operations
 7. **Adjust system configurations** in the ZRAM root to prevent mounting original partitions
 8. **Switch root** to the ZRAM device and continue booting
+
+### Boot Modes
+
+zramroot supports two different boot modes:
+
+#### 1. Kernel Parameter Mode (Default)
+- Traditional method requiring the `zramroot` kernel parameter
+- Create a separate bootloader entry with `zramroot` added to kernel parameters
+- Only boots with ZRAM when you explicitly select that boot entry
+
+#### 2. Interactive Prompt Mode (New!)
+- Shows a prompt during every boot: "Boot with ZRAM? [y/N]"
+- Press 'y' to boot with ZRAM, 'n' or wait for timeout to boot normally
+- No kernel parameter needed - works with your existing boot entry
+- Configurable timeout and default choice
+- Perfect for systems where bootloader configuration is difficult or unavailable
+
+You can enable interactive mode by setting `ZRAM_INTERACTIVE_PROMPT="yes"` in `/etc/zramroot.conf`
+
+## Performance Features
+
+### Intelligent Parallel Copying
+
+zramroot uses an advanced multithreaded copying system that maximizes CPU utilization:
+
+- **Auto-detects optimal thread count** based on CPU cores and available RAM
+- **Dynamic directory splitting**: Large directories (like `/usr/`) are automatically split into subdirectories and distributed across threads
+- **Load balancing**: Work is distributed evenly across all threads to minimize idle time
+- **Smart threshold calculation**: Directories larger than 2× the average are split for parallel processing
+- **Real-time progress monitoring**: Visual progress bar shows active threads and completion percentage
+
+**Example:**
+Instead of one thread copying all of `/usr/` while others sit idle, the system might distribute:
+- Thread 1: `/usr/lib/`
+- Thread 2: `/usr/share/`
+- Thread 3: `/usr/bin/`
+- Thread 4: `/usr/local/` + smaller directories
+
+This results in significantly faster copy times and better resource utilization.
 
 ## Supported Systems
 
@@ -60,6 +99,7 @@ The install script will:
 - **Install all components** to the appropriate locations
 - **Create backups** of files it replaces
 - **Add a new boot entry** with the `zramroot` kernel parameter
+- **If bootloader configuration fails**: Offer to enable interactive prompt mode instead
 
 ### Manual Installation
 
@@ -178,6 +218,33 @@ sudo update-initramfs -u -k all
 ```
 
 ### Configuration Options
+
+#### Boot Mode Configuration
+```
+ZRAM_INTERACTIVE_PROMPT="no"
+ZRAM_DEFAULT_CHOICE="no"
+ZRAM_PROMPT_TIMEOUT=10
+```
+- `ZRAM_INTERACTIVE_PROMPT`: Enable interactive boot prompt (options: "yes" or "no")
+  - "no" (default): Only boot with ZRAM if kernel parameter is present
+  - "yes": Always show interactive prompt asking to boot with ZRAM
+- `ZRAM_DEFAULT_CHOICE`: Default choice when prompt times out (options: "yes" or "no")
+  - "yes": Boot with ZRAM by default (user must press 'n' to skip)
+  - "no" (default): Boot normally by default (user must press 'y' to use ZRAM)
+- `ZRAM_PROMPT_TIMEOUT`: Timeout in seconds for interactive prompt (0 = wait indefinitely)
+
+**Example Interactive Prompt:**
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                  ZRAM Root Boot Configuration
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Boot with ZRAM (copy root filesystem to RAM)? [y/N]
+  Default: NO
+  Timeout: 10 seconds
+
+  Choice: _
+```
 
 #### Debugging
 ```

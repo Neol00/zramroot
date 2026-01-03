@@ -3,13 +3,6 @@
 # This is busybox ash, not bash - be careful with syntax!
 
 run_hook() {
-    # --- CRITICAL: Check for zramroot kernel parameter FIRST ---
-    # Only proceed if "zramroot" is in kernel command line
-    if ! grep -q '\bzramroot\b' /proc/cmdline; then
-        # No zramroot parameter - exit silently and let normal boot continue
-        return 0
-    fi
-
     # --- Global Variables ---
     CONFIG_FILE="/etc/zramroot.conf"
     DEBUG_MODE="no"
@@ -29,8 +22,11 @@ run_hook() {
     ZRAM_SWAP_ALGO="lz4"
     ZRAM_SWAP_PRIORITY=10
     ZRAM_TEMP_MNT="/zram_root"
+    ZRAM_INTERACTIVE_PROMPT="no"
+    ZRAM_DEFAULT_CHOICE="no"
+    ZRAM_PROMPT_TIMEOUT=10
 
-    # Load configuration
+    # Load configuration EARLY
     if [ -f "${CONFIG_FILE}" ]; then
         . "${CONFIG_FILE}"
     fi
@@ -178,11 +174,12 @@ run_hook() {
         local work_dir="/tmp/parallel_rsync_work"
 
         mkdir -p "$work_dir"
-        rm -f "${work_dir}/job_"*
+        rm -f "${work_dir}/job_"* "${work_dir}/"*.list* 2>/dev/null
 
         local dir_list="${work_dir}/directories.list"
+        local work_items="${work_dir}/work_items.list"
 
-        # Get subdirectories, excluding special ones
+        # Scan top-level directories
         find "$source" -maxdepth 1 -type d ! -path "$source" \
             ! -name "dev" ! -name "proc" ! -name "sys" ! -name "tmp" \
             ! -name "run" ! -name "mnt" ! -name "media" ! -name "lost+found" \
@@ -196,8 +193,48 @@ run_hook() {
             fi
         done
 
-        # Sort by size (largest first)
-        sort -rn -t: -k1 "$dir_list" > "${dir_list}.sorted"
+        # Calculate total size and threshold for splitting
+        local total_kb
+        total_kb=$(awk -F: '{sum+=$1} END{print sum}' "$dir_list")
+        local avg_per_thread=$((total_kb / thread_count))
+        local split_threshold=$((avg_per_thread * 2))  # Split dirs larger than 2x average
+
+        log_debug "Total: $((total_kb / 1024))MB, split threshold: $((split_threshold / 1024))MB"
+
+        # Process each directory - split large ones, keep small ones whole
+        while IFS=: read size_kb dir_name; do
+            if [ "$size_kb" -gt "$split_threshold" ]; then
+                # Large directory - split into subdirectories
+                log_debug "Splitting large dir: ${dir_name} ($((size_kb / 1024))MB)"
+
+                find "${source}/${dir_name}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read subdir; do
+                    local sub_size
+                    sub_size=$(du -sk "$subdir" 2>/dev/null | awk '{print $1}' || echo "0")
+                    local sub_name
+                    sub_name=$(echo "$subdir" | sed "s|^${source}/||")
+                    if [ "$sub_size" -gt 0 ]; then
+                        echo "${sub_size}:SUBDIR:${sub_name}" >> "$work_items"
+                    fi
+                done
+
+                # Add any files directly in this directory
+                local files_size
+                files_size=$(find "${source}/${dir_name}" -maxdepth 1 -type f -o -maxdepth 1 -type l 2>/dev/null | \
+                            xargs du -sk 2>/dev/null | awk '{sum+=$1} END{print sum}' || echo "0")
+                if [ -n "$files_size" ] && [ "$files_size" -gt 0 ]; then
+                    echo "${files_size}:FILES:${dir_name}" >> "$work_items"
+                fi
+            else
+                # Small directory - keep whole
+                echo "${size_kb}:DIR:${dir_name}" >> "$work_items"
+            fi
+        done < "$dir_list"
+
+        # Add root files as work item
+        echo "0:ROOT:." >> "$work_items"
+
+        # Sort work items by size (largest first)
+        sort -rn -t: -k1 "$work_items" > "${work_items}.sorted"
 
         # Initialize job files
         local i=0
@@ -207,14 +244,9 @@ run_hook() {
             i=$((i + 1))
         done
 
-        # Distribute directories using load balancing
-        while read line; do
-            if [ -n "$line" ]; then
-                local size
-                size=$(echo "$line" | cut -d: -f1)
-                local dir_name
-                dir_name=$(echo "$line" | cut -d: -f2)
-
+        # Distribute work items using load balancing
+        while IFS=: read size_kb item_type item_path; do
+            if [ -n "$item_path" ]; then
                 # Find job with minimum size
                 local min_job=0
                 local min_size
@@ -231,15 +263,26 @@ run_hook() {
                     i=$((i + 1))
                 done
 
-                # Add to job with minimum size
-                echo "$dir_name" >> "${work_dir}/job_${min_job}.list"
-                local new_size=$((min_size + size))
+                # Add work item to job with minimum size
+                echo "${item_type}:${item_path}" >> "${work_dir}/job_${min_job}.list"
+                local new_size=$((min_size + size_kb))
                 echo "$new_size" > "${work_dir}/job_${min_job}.size"
-            fi
-        done < "${dir_list}.sorted"
 
-        # Add root files to job 0
-        echo "ROOT_FILES" >> "${work_dir}/job_0.list"
+                log_debug "Assigned ${item_type} ${item_path} ($((size_kb / 1024))MB) to job ${min_job}"
+            fi
+        done < "${work_items}.sorted"
+
+        # Log final distribution
+        i=0
+        while [ $i -lt $thread_count ]; do
+            local job_size_kb
+            job_size_kb=$(cat "${work_dir}/job_${i}.size")
+            local job_size_mb=$((job_size_kb / 1024))
+            local item_count
+            item_count=$(wc -l < "${work_dir}/job_${i}.list")
+            log_debug "Job ${i}: ${item_count} items, ~${job_size_mb}MB"
+            i=$((i + 1))
+        done
 
         echo "$work_dir"
     }
@@ -284,19 +327,37 @@ run_hook() {
 
             if [ -s "$job_file" ]; then
                 (
-                    while read item; do
-                        if [ "$item" = "ROOT_FILES" ]; then
-                            rsync -ax \
-                                  --include="/*" --exclude="/*/" \
-                                  --exclude="/dev" --exclude="/proc" --exclude="/sys" \
-                                  --exclude="/tmp" --exclude="/run" --exclude="/mnt" \
-                                  --exclude="/media" --exclude="/lost+found" \
-                                  "${source}/" "${dest}/" 2>>"$job_log"
-                        else
-                            mkdir -p "${dest}/${item}"
-                            rsync -ax --delete \
-                                  "${source}/${item}/" "${dest}/${item}/" 2>>"$job_log"
-                        fi
+                    while IFS=: read item_type item_path; do
+                        case "$item_type" in
+                            ROOT)
+                                # Copy root level files and symlinks only
+                                rsync -ax \
+                                      --include="/*" --exclude="/*/" \
+                                      --exclude="/dev" --exclude="/proc" --exclude="/sys" \
+                                      --exclude="/tmp" --exclude="/run" --exclude="/mnt" \
+                                      --exclude="/media" --exclude="/lost+found" \
+                                      "${source}/" "${dest}/" 2>>"$job_log"
+                                ;;
+                            DIR)
+                                # Copy entire directory
+                                mkdir -p "${dest}/${item_path}"
+                                rsync -ax --delete \
+                                      "${source}/${item_path}/" "${dest}/${item_path}/" 2>>"$job_log"
+                                ;;
+                            SUBDIR)
+                                # Copy subdirectory (path already includes parent)
+                                mkdir -p "${dest}/${item_path}"
+                                rsync -ax --delete \
+                                      "${source}/${item_path}/" "${dest}/${item_path}/" 2>>"$job_log"
+                                ;;
+                            FILES)
+                                # Copy only files from this directory (not subdirs)
+                                mkdir -p "${dest}/${item_path}"
+                                rsync -ax \
+                                      --include="/*" --exclude="/*/" \
+                                      "${source}/${item_path}/" "${dest}/${item_path}/" 2>>"$job_log"
+                                ;;
+                        esac
                     done < "$job_file"
                 ) &
 
@@ -438,9 +499,99 @@ run_hook() {
         fi
     }
 
+    # --- Interactive Prompt Function ---
+    prompt_user_for_zram() {
+        local timeout="${ZRAM_PROMPT_TIMEOUT}"
+        local default="${ZRAM_DEFAULT_CHOICE}"
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "                      ZRAM Root Boot Configuration"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+
+        if [ "$default" = "yes" ]; then
+            echo "  Boot with ZRAM (copy root filesystem to RAM)? [Y/n]"
+            echo "  Default: YES"
+        else
+            echo "  Boot with ZRAM (copy root filesystem to RAM)? [y/N]"
+            echo "  Default: NO"
+        fi
+
+        if [ "$timeout" -gt 0 ]; then
+            echo "  Timeout: ${timeout} seconds"
+        fi
+
+        echo ""
+        echo -n "  Choice: "
+
+        # Read user input with timeout
+        local choice=""
+        if [ "$timeout" -eq 0 ]; then
+            # No timeout - wait indefinitely
+            read choice
+        else
+            # Use timeout - busybox ash compatible
+            choice=$(timeout "$timeout" sh -c 'read choice; echo "$choice"' 2>/dev/null || echo "")
+        fi
+
+        # Process choice
+        choice=$(echo "$choice" | tr '[:upper:]' '[:lower:]')
+
+        if [ -z "$choice" ]; then
+            # No input - use default
+            echo ""
+            echo "  Using default: $default"
+            echo ""
+            if [ "$default" = "yes" ]; then
+                return 0
+            else
+                return 1
+            fi
+        elif [ "$choice" = "y" ] || [ "$choice" = "yes" ]; then
+            echo ""
+            echo "  Booting with ZRAM..."
+            echo ""
+            return 0
+        elif [ "$choice" = "n" ] || [ "$choice" = "no" ]; then
+            echo ""
+            echo "  Skipping ZRAM, booting normally..."
+            echo ""
+            return 1
+        else
+            # Invalid input - use default
+            echo ""
+            echo "  Invalid input. Using default: $default"
+            echo ""
+            if [ "$default" = "yes" ]; then
+                return 0
+            else
+                return 1
+            fi
+        fi
+    }
+
     # =================================================================
     # MAIN EXECUTION STARTS HERE
     # =================================================================
+
+    # --- Determine if we should boot with ZRAM ---
+    if [ "${ZRAM_INTERACTIVE_PROMPT}" = "yes" ]; then
+        # Interactive mode - always prompt user
+        log_info "Interactive prompt mode enabled - asking user"
+        if ! prompt_user_for_zram; then
+            log_info "User chose normal boot - exiting"
+            return 0
+        fi
+        log_info "User chose to boot with ZRAM"
+    else
+        # Kernel parameter mode - check for zramroot parameter
+        if ! grep -q '\bzramroot\b' /proc/cmdline; then
+            # No zramroot parameter - exit silently and let normal boot continue
+            return 0
+        fi
+        log_info "zramroot parameter found - starting setup"
+    fi
 
     log_info "=== STARTING ZRAM ROOT SETUP PROCESS ==="
 

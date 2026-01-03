@@ -558,6 +558,69 @@ backup_file() {
     fi
 }
 
+# Function to enable interactive prompt mode in zramroot.conf
+enable_interactive_prompt() {
+    local config_file="/etc/zramroot.conf"
+
+    echo ""
+    print_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    print_info "           Interactive Prompt Mode (Alternative to Kernel Parameter)"
+    print_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    print_info "Since bootloader configuration is not available, you can enable"
+    print_info "interactive prompt mode instead. This will ask you at boot time"
+    print_info "whether you want to boot with ZRAM or not."
+    echo ""
+    print_info "With interactive prompt mode:"
+    print_info "  • You'll see a prompt during boot: 'Boot with ZRAM? [y/N]'"
+    print_info "  • Press 'y' to boot with ZRAM, or 'n' (or wait) for normal boot"
+    print_info "  • No kernel parameter needed"
+    echo ""
+
+    read -p "Would you like to enable interactive prompt mode? (y/n): " enable_prompt
+
+    if [[ "$enable_prompt" =~ ^[Yy]$ ]]; then
+        if [ ! -f "$config_file" ]; then
+            print_error "Configuration file not found at $config_file"
+            print_warning "Please run the installation first, then manually edit the config file."
+            return 1
+        fi
+
+        # Backup the config file
+        backup_file "$config_file"
+
+        # Enable interactive prompt mode
+        sed -i 's/^ZRAM_INTERACTIVE_PROMPT=.*/ZRAM_INTERACTIVE_PROMPT="yes"/' "$config_file"
+
+        # Verify the change
+        if grep -q '^ZRAM_INTERACTIVE_PROMPT="yes"' "$config_file"; then
+            print_success "Interactive prompt mode enabled in $config_file"
+            echo ""
+            print_info "At boot time, you will see:"
+            print_info "  Boot with ZRAM (copy root filesystem to RAM)? [y/N]"
+            print_info "  Default: NO"
+            print_info "  Timeout: 10 seconds"
+            echo ""
+            print_info "You can customize the timeout and default choice by editing:"
+            print_info "  $config_file"
+            echo ""
+            print_info "Look for these settings:"
+            print_info "  ZRAM_INTERACTIVE_PROMPT=\"yes\"    # Enable prompt"
+            print_info "  ZRAM_DEFAULT_CHOICE=\"no\"         # Default if no input"
+            print_info "  ZRAM_PROMPT_TIMEOUT=10            # Seconds to wait"
+
+            return 0
+        else
+            print_error "Failed to enable interactive prompt mode"
+            return 1
+        fi
+    else
+        print_info "Interactive prompt mode not enabled."
+        print_info "You will need to manually add 'zramroot' to your kernel parameters."
+        return 1
+    fi
+}
+
 # Install based on init system
 if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
     print_info "Installing for initramfs-tools (Debian/Ubuntu)..."
@@ -759,8 +822,12 @@ else
             echo ""
             print_warning "Supported bootloaders:"
             print_info "  - GRUB (requires /boot/grub/grub.cfg and update-grub command)"
-            print_info "  - systemd-boot (requires /boot/loader/ and bootctl command)" 
+            print_info "  - systemd-boot (requires /boot/loader/ and bootctl command)"
             print_info "  - extlinux/syslinux (requires config files and commands)"
+            echo ""
+            print_info "You have two options:"
+            print_info "  1. Continue with manual bootloader configuration"
+            print_info "  2. Enable interactive prompt mode (ask at boot time)"
             echo ""
             read -p "Continue with manual configuration? (y/n): " continue_manual
             if [[ ! "$continue_manual" =~ ^[Yy]$ ]]; then
@@ -1438,30 +1505,37 @@ elif [ "$bootloader" = "manual" ]; then
     print_info "1. Create a new boot entry that loads the same kernel and initramfs"
     print_info "2. Add 'zramroot' to the kernel command line parameters"
     echo ""
-    
+
     # Get root UUID for manual configuration
     root_uuid=$(grep -oP 'UUID=\K[a-f0-9-]+' /proc/cmdline 2>/dev/null || \
                 grep -oP 'root=UUID=\K[a-f0-9-]+' /proc/cmdline 2>/dev/null || \
                 awk '$2 == "/" {print $1}' /etc/fstab | grep -oP 'UUID=\K[a-f0-9-]+' 2>/dev/null || \
                 blkid -s UUID -o value $(findmnt -no SOURCE /))
-    
+
     print_info "Your root UUID is: ${root_uuid}"
     print_info "Example kernel parameters: root=UUID=${root_uuid} rw zramroot"
     echo ""
 
+    # Offer interactive prompt mode as an alternative
+    enable_interactive_prompt
+
 elif [ "$bootloader" = "skip" ]; then
     print_info "Bootloader configuration skipped as requested."
-    
+
     # Get root UUID for informational purposes
     root_uuid=$(grep -oP 'UUID=\K[a-f0-9-]+' /proc/cmdline 2>/dev/null || \
                 grep -oP 'root=UUID=\K[a-f0-9-]+' /proc/cmdline 2>/dev/null || \
                 awk '$2 == "/" {print $1}' /etc/fstab | grep -oP 'UUID=\K[a-f0-9-]+' 2>/dev/null || \
                 blkid -s UUID -o value $(findmnt -no SOURCE /))
-    
+
     echo ""
     print_warning "To enable ZRAMroot, you'll need to manually add 'zramroot' to your kernel parameters."
     print_info "Your root UUID is: ${root_uuid}"
     print_info "Example kernel parameters: root=UUID=${root_uuid} rw zramroot"
+    echo ""
+
+    # Offer interactive prompt mode as an alternative
+    enable_interactive_prompt
 
 fi
 
