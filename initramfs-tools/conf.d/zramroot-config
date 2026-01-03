@@ -1,4 +1,22 @@
 # Configuration for ZRAM Root Boot with persistent logging
+# This configuration file works with both initramfs-tools (Debian/Ubuntu)
+# and mkinitcpio (Arch Linux) implementations
+
+# --- Boot Mode Configuration ---
+# Interactive prompt mode: Ask user at boot time whether to use ZRAM
+# Options: yes, no
+# - "no": Only boot with ZRAM if kernel parameter "zramroot" is present (default)
+# - "yes": Always show interactive prompt asking to boot with ZRAM
+ZRAM_INTERACTIVE_PROMPT="no"
+
+# Default choice when interactive prompt times out or if user doesn't respond
+# Options: yes, no
+# - "yes": Boot with ZRAM by default (user must press 'n' to skip)
+# - "no": Boot normally by default (user must press 'y' to use ZRAM)
+ZRAM_DEFAULT_CHOICE="no"
+
+# Timeout in seconds for interactive prompt (0 = wait indefinitely)
+ZRAM_PROMPT_TIMEOUT=10
 
 # --- Debugging ---
 # Enable verbose logging to the physical root partition at /var/log/zramroot.log
