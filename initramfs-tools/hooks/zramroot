@@ -203,38 +203,58 @@ case "${ZRAM_FS_TYPE}" in
         ;;
 esac
 
-# Get compression algorithm from config
-ZRAM_ALGO="zstd" # Default
+# Get compression algorithms from config (both root and swap)
+ZRAM_ALGO="lz4" # Default (matches zramroot.conf)
+ZRAM_SWAP_ALGO="lz4" # Default (matches zramroot.conf)
 if [ -f "${CONFIG_FILE}" ]; then
     algo=$(grep "^ZRAM_ALGO=" "${CONFIG_FILE}" | cut -d'"' -f2)
     if [ -n "${algo}" ]; then
         ZRAM_ALGO="${algo}"
-        log_hook "Found compression algorithm in config: ${ZRAM_ALGO}"
+        log_hook "Found root compression algorithm in config: ${ZRAM_ALGO}"
+    fi
+    swap_algo=$(grep "^ZRAM_SWAP_ALGO=" "${CONFIG_FILE}" | cut -d'"' -f2)
+    if [ -n "${swap_algo}" ]; then
+        ZRAM_SWAP_ALGO="${swap_algo}"
+        log_hook "Found swap compression algorithm in config: ${ZRAM_SWAP_ALGO}"
     fi
 fi
 
-# Add compression modules based on algorithm
-log_hook "Adding compression modules for algorithm: ${ZRAM_ALGO}..."
-case "${ZRAM_ALGO}" in
-    zstd)
-        log_debug "Adding zstd module"
-        manual_add_modules zstd
-        ;;
-    lz4)
-        log_debug "Adding lz4 module"
-        manual_add_modules lz4
-        ;;
-    lzo)
-        log_debug "Adding lzo module"
-        manual_add_modules lzo
-        ;;
-    *)
-        log_hook "Adding all compression modules for compatibility"
-        manual_add_modules zstd
-        manual_add_modules lz4
-        manual_add_modules lzo
-        ;;
-esac
+# Helper function to add compression modules for an algorithm
+add_compression_modules() {
+    local algo="$1"
+    case "${algo}" in
+        zstd)
+            log_debug "Adding zstd module"
+            manual_add_modules zstd
+            ;;
+        lz4|lz4hc)
+            log_debug "Adding lz4 module"
+            manual_add_modules lz4
+            # lz4hc uses the same kernel module as lz4
+            ;;
+        lzo|lzo-rle)
+            log_debug "Adding lzo module"
+            manual_add_modules lzo
+            # lzo-rle uses the same kernel module as lzo
+            ;;
+        *)
+            log_hook "Unknown algorithm ${algo}, adding all compression modules for compatibility"
+            manual_add_modules zstd
+            manual_add_modules lz4
+            manual_add_modules lzo
+            ;;
+    esac
+}
+
+# Add compression modules for root ZRAM
+log_hook "Adding compression modules for root algorithm: ${ZRAM_ALGO}..."
+add_compression_modules "${ZRAM_ALGO}"
+
+# Add compression modules for swap ZRAM if different from root
+if [ "${ZRAM_SWAP_ALGO}" != "${ZRAM_ALGO}" ]; then
+    log_hook "Adding compression modules for swap algorithm: ${ZRAM_SWAP_ALGO}..."
+    add_compression_modules "${ZRAM_SWAP_ALGO}"
+fi
 
 # Add extra modules
 EXTRA_MODULES=""
@@ -277,34 +297,43 @@ elif [ -f "${CONFIG_ALT_SOURCE}" ]; then
     fi
 else
     log_hook "Configuration file not found! Creating a default one in ${CONFIG_DEST}."
-    # Create default config file
+    # Create default config file - values match zramroot.conf
     cat > "${CONFIG_DEST}" << EOF
-# Configuration for ZRAM Root Boot with persistent logging
+# Configuration for ZRAM Root Boot
 
 # --- Debugging ---
-# Enable verbose logging to the physical root partition at /var/log/zramroot.log
+# Enable verbose logging to /var/log/zramroot-*.log (default)
 DEBUG_MODE="no"
+
+# Directory for zramroot debug logs.
+# Default: /var/log (on the physical root once mounted)
+DEBUG_LOG_DIR="/var/log"
+
+# Optional: device to mount for DEBUG_LOG_DIR (e.g., UUID=xxxx-xxxx)
+DEBUG_LOG_DEVICE=""
 
 # --- ZRAM Device Settings ---
 # Manually specify ZRAM device size in MiB.
 # If set to 0, size will be calculated automatically.
 ZRAM_SIZE_MiB=0
 
-# Compression algorithm (e.g., lz4, zstd, lzo-rle).
+# Compression algorithm
+# Options: lz4, lz4hc, zstd, lzo, lzo-rle
 ZRAM_ALGO="lz4"
 
-# Filesystem type for ZRAM device (e.g., ext4, btrfs, xfs)
+# Filesystem type for ZRAM device
+# Options: ext4, btrfs, xfs
 ZRAM_FS_TYPE="ext4"
 
 # Mount options for the ZRAM filesystem
-ZRAM_MOUNT_OPTS="rw,noatime"
+ZRAM_MOUNT_OPTS="noatime"
 
 # --- RAM Management Settings ---
 # Minimum amount of RAM (in MiB) to leave free after allocating ZRAM
 RAM_MIN_FREE_MiB=512
 
 # Preferred amount of RAM (in MiB) to leave free after allocating ZRAM
-RAM_PREF_FREE_MiB=512
+RAM_PREF_FREE_MiB=1024
 
 # Minimum ZRAM space (in MiB) to leave free for growth
 ZRAM_MIN_FREE_MiB=256
@@ -313,7 +342,7 @@ ZRAM_MIN_FREE_MiB=256
 ZRAM_MAX_FREE_MiB=35840
 
 # --- Resource Calculation (Used only if ZRAM_SIZE_MiB is 0) ---
-# Buffer percentage to add to the original used size when calculating ZRAM size automatically.
+# Buffer percentage to add to the original used size when calculating ZRAM size
 ZRAM_BUFFER_PERCENT=10
 
 # --- ZRAM Swap Settings ---
@@ -332,15 +361,31 @@ ZRAM_SWAP_ALGO="lz4"
 # Priority for ZRAM swap (higher numbers = higher priority, default swap is usually 0)
 ZRAM_SWAP_PRIORITY=10
 
+# --- Include/Exclude Patterns ---
+# Patterns to exclude from ZRAM copy (space-separated, supports wildcards)
+ZRAM_EXCLUDE_PATTERNS=""
+
+# Patterns to explicitly include (overrides excludes, space-separated)
+ZRAM_INCLUDE_PATTERNS=""
+
+# --- Mount-on-Disk (Bind Mounts from Physical Storage) ---
+# Directories to exclude from ZRAM but mount from physical disk after boot
+ZRAM_MOUNT_ON_DISK=""
+
+# Mount options for physical root when using ZRAM_MOUNT_ON_DISK
+ZRAM_PHYSICAL_ROOT_OPTS="rw"
+
 # --- Advanced (Usually leave as default) ---
 # ZRAM Device Number (usually 0)
+# IMPORTANT: ZRAM_DEVICE_NUM and ZRAM_SWAP_DEVICE_NUM must be different values!
+# If they are the same, one device will fail to be created.
 ZRAM_DEVICE_NUM=0
 
-# Kernel parameter word to trigger ZRAM boot (no '=' needed)
+# Kernel parameter word to trigger ZRAM boot
 TRIGGER_PARAMETER="zramroot"
 
 # Seconds to wait for the real root device to appear
-WAIT_TIMEOUT=5
+WAIT_TIMEOUT=120
 EOF
     log_debug "Created default configuration file"
 fi

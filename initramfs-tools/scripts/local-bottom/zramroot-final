@@ -1,0 +1,30 @@
+#!/bin/sh
+PREREQ=""
+prereqs()
+{
+	echo "$PREREQ"
+}
+
+case $1 in
+# get pre-requisites
+prereqs)
+	prereqs
+	exit 0
+	;;
+esac
+
+# Move physical root mount if it exists
+if [ -d "/mnt/physical_root" ] && mountpoint -q "/mnt/physical_root"; then
+    # ${rootmnt} is provided by initramfs-tools, usually /root
+    if [ -d "${rootmnt}" ]; then
+        # Create destination directory in the new root
+        mkdir -p "${rootmnt}/mnt/physical_root"
+        
+        # Move the mount from initramfs to real root
+        if mount -o move "/mnt/physical_root" "${rootmnt}/mnt/physical_root"; then
+            echo "zramroot: moved physical root to ${rootmnt}/mnt/physical_root"
+        else
+            echo "zramroot: failed to move physical root"
+        fi
+    fi
+fi

@@ -1,6 +1,6 @@
 #!/bin/bash
-# ZRAMroot Installation Script
-# This script installs ZRAMroot components and configures your system to use it
+# zramroot Installation Script
+# This script installs zramroot components and configures your system to use it
 
 # Colors for better UX
 RED='\033[0;31m'
@@ -30,7 +30,7 @@ print_success() {
 print_header() {
     clear
     echo "============================================================"
-    echo "                  ZRAMroot Installation                     "
+    echo "                  zramroot Installation                     "
     echo "============================================================"
     echo ""
 }
@@ -60,13 +60,11 @@ detect_init_system() {
         return 0
     fi
 
-    # Check for dracut (Fedora, RHEL, openSUSE)
-    if command -v dracut >/dev/null 2>&1; then
-        print_error "Detected dracut init system" >&2
-        print_error "dracut is not currently supported by ZRAMroot" >&2
-        print_info "Supported systems: Debian/Ubuntu (initramfs-tools), Arch Linux (mkinitcpio)" >&2
-        echo "unsupported"
-        return 1
+    # Check for dracut (Fedora, RHEL, Qubes OS, openSUSE)
+    if command -v dracut >/dev/null 2>&1 && [ -d "/usr/lib/dracut" ]; then
+        print_info "Detected: Fedora/RHEL/Qubes OS (dracut)" >&2
+        echo "dracut"
+        return 0
     fi
 
     # Unknown init system
@@ -74,6 +72,7 @@ detect_init_system() {
     print_info "Supported systems:" >&2
     print_info "  - Debian/Ubuntu (initramfs-tools)" >&2
     print_info "  - Arch Linux/Artix/Manjaro (mkinitcpio)" >&2
+    print_info "  - Fedora/RHEL/Qubes OS (dracut)" >&2
     echo "unknown"
     return 1
 }
@@ -85,29 +84,59 @@ if [ "$INIT_SYSTEM" = "unsupported" ] || [ "$INIT_SYSTEM" = "unknown" ]; then
     exit 1
 fi
 
+# --- Load configuration from zramroot.conf ---
+# This allows user customizations to take effect during install
+TRIGGER_PARAMETER="zramroot"  # Default value
+ZRAM_FS_TYPE="ext4"           # Default filesystem type
+CONFIG_FILE="zramroot.conf"   # Local config in current directory
+
+if [ -f "$CONFIG_FILE" ]; then
+    # Extract TRIGGER_PARAMETER from config file
+    trigger_setting=$(grep "^TRIGGER_PARAMETER=" "$CONFIG_FILE" 2>/dev/null | cut -d'"' -f2)
+    if [ -n "$trigger_setting" ]; then
+        TRIGGER_PARAMETER="$trigger_setting"
+        print_info "Using custom trigger parameter from config: ${TRIGGER_PARAMETER}"
+    fi
+
+    # Extract ZRAM_FS_TYPE from config file
+    fs_type_setting=$(grep "^ZRAM_FS_TYPE=" "$CONFIG_FILE" 2>/dev/null | cut -d'"' -f2)
+    if [ -n "$fs_type_setting" ]; then
+        ZRAM_FS_TYPE="$fs_type_setting"
+        print_info "Using filesystem type from config: ${ZRAM_FS_TYPE}"
+    fi
+fi
+
 print_header
 
 # Dependency checking function
 check_dependencies() {
     print_info "=== Checking System Dependencies ==="
     echo ""
-    
+
     # Core required binaries (from zramroot hook script copy_bin_list)
     local core_bins="busybox sh mount umount mkdir rmdir echo cat grep sed df awk rsync cp touch date \
                      mountpoint zramctl lsmod modprobe fsck blkid udevadm fuser find tail head ls sync"
-    
-    # Filesystem tools
-    local fs_bins="mkfs.ext4 fsck.ext4"
-    
+
+    # Filesystem tools - based on configured ZRAM_FS_TYPE
+    local fs_bins="mkfs.ext4 fsck.ext4"  # ext4 always included as fallback
+    case "${ZRAM_FS_TYPE}" in
+        btrfs)
+            fs_bins="$fs_bins mkfs.btrfs btrfs"
+            print_info "Including btrfs tools (ZRAM_FS_TYPE=${ZRAM_FS_TYPE})"
+            ;;
+        xfs)
+            fs_bins="$fs_bins mkfs.xfs xfs_repair"
+            print_info "Including xfs tools (ZRAM_FS_TYPE=${ZRAM_FS_TYPE})"
+            ;;
+    esac
+
     # Additional binaries used in zramroot-boot script
     local boot_bins="cut du kill mkfs mkswap nproc printf rm sort sleep timeout wait wc"
-    
+
     # System utilities that may not be in core but are needed
     local util_bins="seq"
-    
-    # Optional binaries (for different filesystems)
-    local btrfs_bins="mkfs.btrfs btrfs"
-    local xfs_bins="mkfs.xfs xfs_repair"
+
+    # Optional binaries (for different filesystems) - only checked if LVM detected
     local lvm_bins="vgchange lvchange dmsetup lvscan vgscan pvscan"
     
     local missing_core=()
@@ -202,34 +231,7 @@ check_dependencies() {
             print_info "✓ Found: $bin"
         fi
     done
-    
-    # Check filesystem-specific tools
-    if [ -f "/etc/zramroot.conf" ]; then
-        local fs_type=$(grep "^ZRAM_FS_TYPE=" "/etc/zramroot.conf" 2>/dev/null | cut -d'"' -f2)
-        case "$fs_type" in
-            btrfs)
-                print_info "Checking btrfs utilities (required for ZRAM_FS_TYPE=btrfs)..."
-                for bin in $btrfs_bins; do
-                    if ! check_binary "$bin"; then
-                        missing_core+=("$bin")
-                        print_warning "Missing: $bin"
-                        all_good=false
-                    fi
-                done
-                ;;
-            xfs)
-                print_info "Checking XFS utilities (required for ZRAM_FS_TYPE=xfs)..."
-                for bin in $xfs_bins; do
-                    if ! check_binary "$bin"; then
-                        missing_core+=("$bin")
-                        print_warning "Missing: $bin"
-                        all_good=false
-                    fi
-                done
-                ;;
-        esac
-    fi
-    
+
     # Check LVM tools if system uses LVM
     local root_device="${ROOT:-$(grep -oP 'root=\K[^[:space:]]+' /proc/cmdline)}"
     if echo "$root_device" | grep -q "/dev/mapper/\|/dev/.*-.*" && command -v vgdisplay >/dev/null 2>&1; then
@@ -330,6 +332,10 @@ show_package_install_instructions() {
             print_info "For Fedora systems, run:"
             echo "    sudo dnf install ${packages[*]}"
             ;;
+        qubes)
+            print_info "For Qubes systems, run:"
+            echo "    sudo qubes-dom0-update --action=install ${packages[*]}"
+            ;;
         centos|rhel|rocky|alma)
             print_info "For RHEL/CentOS systems, run:"
             echo "    sudo yum install ${packages[*]}"
@@ -377,18 +383,23 @@ fi
 print_header
 
 # Display warning and get confirmation
-print_warning "ZRAMroot might make your installation unbootable if not configured correctly."
+print_warning "zramroot might make your installation unbootable if not configured correctly."
 print_warning "This script will:"
 
 if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
-    print_info "  • Replace /usr/share/initramfs-tools/scripts/local with ZRAMroot version"
-    print_info "  • Install ZRAMroot hooks and configuration files"
+    print_info "  • Replace /usr/share/initramfs-tools/scripts/local with zramroot version"
+    print_info "  • Install zramroot hooks and configuration files"
     print_info "  • Optionally configure a bootloader entry (GRUB, systemd-boot, or extlinux)"
-    print_info "  • Rebuild your initramfs to include ZRAMroot support"
+    print_info "  • Rebuild your initramfs to include zramroot support"
 elif [ "$INIT_SYSTEM" = "mkinitcpio" ]; then
-    print_info "  • Install ZRAMroot hooks to /usr/lib/initcpio/"
+    print_info "  • Install zramroot hooks to /usr/lib/initcpio/"
     print_info "  • Install configuration file to /etc/zramroot.conf"
     print_info "  • Provide instructions for manual mkinitcpio.conf configuration"
+elif [ "$INIT_SYSTEM" = "dracut" ]; then
+    print_info "  • Install zramroot dracut module to an auto-detected /usr/lib/dracut/modules.d/XXzramroot/"
+    print_info "  • Install configuration file to /etc/zramroot.conf"
+    print_info "  • Rebuild initramfs with dracut --force --regenerate-all"
+    print_info "  • Optionally configure a GRUB2 bootloader entry"
 fi
 
 echo ""
@@ -408,6 +419,7 @@ print_info "Checking for required files for ${INIT_SYSTEM}..."
 if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
     FILES=(
         "initramfs-tools/scripts/local-premount/zramroot-boot"
+        "initramfs-tools/scripts/local-bottom/zramroot-final"
         "initramfs-tools/scripts/local"
         "initramfs-tools/hooks/zramroot"
         "initramfs-tools/conf.d/zramroot-config"
@@ -416,6 +428,14 @@ elif [ "$INIT_SYSTEM" = "mkinitcpio" ]; then
     FILES=(
         "mkinitcpio/hooks/zramroot"
         "mkinitcpio/install/zramroot"
+        "zramroot.conf"
+    )
+elif [ "$INIT_SYSTEM" = "dracut" ]; then
+    FILES=(
+        "dracut/zramroot/module-setup.sh"
+        "dracut/zramroot/zramroot-mount.sh"
+        "dracut/zramroot/zramroot-finalize.sh"
+        "dracut/rootfs-block/mount-root.sh"
         "zramroot.conf"
     )
 else
@@ -438,10 +458,17 @@ if [ $MISSING -eq 1 ]; then
         print_info "  initramfs-tools/hooks/zramroot"
         print_info "  initramfs-tools/scripts/local"
         print_info "  initramfs-tools/scripts/local-premount/zramroot-boot"
+        print_info "  initramfs-tools/scripts/local-bottom/zramroot-final"
         print_info "  initramfs-tools/conf.d/zramroot-config"
-    else
+    elif [ "$INIT_SYSTEM" = "mkinitcpio" ]; then
         print_info "  mkinitcpio/hooks/zramroot"
         print_info "  mkinitcpio/install/zramroot"
+        print_info "  zramroot.conf"
+    elif [ "$INIT_SYSTEM" = "dracut" ]; then
+        print_info "  dracut/zramroot/module-setup.sh"
+        print_info "  dracut/zramroot/zramroot-mount.sh"
+        print_info "  dracut/zramroot/zramroot-finalize.sh"
+        print_info "  dracut/rootfs-block/mount-root.sh"
         print_info "  zramroot.conf"
     fi
     exit 1
@@ -529,7 +556,7 @@ if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
         fi
     done
 else
-    print_info "Skipping additional module selection (not applicable for mkinitcpio)"
+    print_info "Skipping additional module selection (not applicable for mkinitcpio and dracut)"
 fi
 
 print_header
@@ -565,6 +592,7 @@ if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
     # Create directory structure
     print_info "Creating directory structure..."
     mkdir -p /usr/share/initramfs-tools/scripts/local-premount
+    mkdir -p /usr/share/initramfs-tools/scripts/local-bottom
     mkdir -p /usr/share/initramfs-tools/hooks
     mkdir -p /usr/share/initramfs-tools/conf.d
 
@@ -586,6 +614,9 @@ if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
     print_info "Copying initramfs-tools files..."
     cp "initramfs-tools/scripts/local-premount/zramroot-boot" "/usr/share/initramfs-tools/scripts/local-premount/zramroot-boot"
     chmod +x "/usr/share/initramfs-tools/scripts/local-premount/zramroot-boot"
+
+    cp "initramfs-tools/scripts/local-bottom/zramroot-final" "/usr/share/initramfs-tools/scripts/local-bottom/zramroot-final"
+    chmod +x "/usr/share/initramfs-tools/scripts/local-bottom/zramroot-final"
 
     cp "initramfs-tools/scripts/local" "/usr/share/initramfs-tools/scripts/local"
     chmod +x "/usr/share/initramfs-tools/scripts/local"
@@ -672,12 +703,184 @@ elif [ "$INIT_SYSTEM" = "mkinitcpio" ]; then
     fi
 
     print_success "mkinitcpio configuration completed!"
+
+elif [ "$INIT_SYSTEM" = "dracut" ]; then
+    print_info "Installing for dracut (Fedora/RHEL/Qubes OS)..."
+
+    DRACUT_MODULES_DIR="/usr/lib/dracut/modules.d"
+
+    # Determine a priority that is after any crypt module and before any fstab/filesystem module
+    get_dracut_zramroot_priority() {
+        local max_crypt=0
+        local min_post=999
+        local base prefix name
+
+        for d in "${DRACUT_MODULES_DIR}"/*; do
+            [ -d "$d" ] || continue
+            base=$(basename "$d")
+            prefix=$(echo "$base" | sed -n 's/^\([0-9][0-9]*\).*/\1/p')
+            [ -n "$prefix" ] || continue
+            name=${base#${prefix}}
+
+            case "$name" in
+                *crypt*)
+                    if [ "$prefix" -gt "$max_crypt" ]; then
+                        max_crypt="$prefix"
+                    fi
+                    ;;
+            esac
+
+            case "$name" in
+                *fstab*|*fs-lib*|*rootfs*|*filesystem*|*filesystems*)
+                    if [ "$prefix" -lt "$min_post" ]; then
+                        min_post="$prefix"
+                    fi
+                    ;;
+            esac
+        done
+
+        local target=94
+        if [ "$max_crypt" -gt 0 ] && [ "$min_post" -lt 999 ]; then
+            target=$((max_crypt + 1))
+            if [ "$target" -ge "$min_post" ]; then
+                target=$((min_post - 1))
+            fi
+        elif [ "$max_crypt" -gt 0 ]; then
+            target=$((max_crypt + 1))
+        elif [ "$min_post" -lt 999 ]; then
+            target=$((min_post - 1))
+        fi
+
+        if [ "$target" -lt 1 ]; then
+            target=94
+        fi
+
+        echo "$target"
+    }
+
+    ZRAMROOT_PRIORITY=$(get_dracut_zramroot_priority)
+    ZRAMROOT_MODULE_DIR="${DRACUT_MODULES_DIR}/${ZRAMROOT_PRIORITY}zramroot"
+
+    # Find existing rootfs-block module directory
+    get_rootfs_block_dir() {
+        for d in "${DRACUT_MODULES_DIR}"/*rootfs-block; do
+            if [ -d "$d" ] && [ -f "$d/mount-root.sh" ]; then
+                echo "$d"
+                return 0
+            fi
+        done
+        echo ""
+        return 1
+    }
+
+    ROOTFS_BLOCK_DIR=$(get_rootfs_block_dir)
+    if [ -z "$ROOTFS_BLOCK_DIR" ]; then
+        print_error "Could not find rootfs-block module directory in ${DRACUT_MODULES_DIR}"
+        print_error "Expected to find a directory like ${DRACUT_MODULES_DIR}/95rootfs-block/"
+        exit 1
+    fi
+    print_info "Found rootfs-block module at: ${ROOTFS_BLOCK_DIR}"
+
+    # Create directory structure
+    print_info "Creating directory structure..."
+    print_info "Using dracut zramroot module priority: ${ZRAMROOT_PRIORITY} (auto-detected)"
+    mkdir -p "${ZRAMROOT_MODULE_DIR}"
+
+    # Clean up legacy zramroot module directories to avoid conflicts
+    for d in "${DRACUT_MODULES_DIR}"/*zramroot; do
+        [ -d "$d" ] || continue
+        if [ "$d" != "${ZRAMROOT_MODULE_DIR}" ]; then
+            print_warning "Removing legacy zramroot module directory: $d"
+            rm -rf "$d"
+        fi
+    done
+
+    # Backup existing files
+    backup_file "${ZRAMROOT_MODULE_DIR}/module-setup.sh"
+    backup_file "${ZRAMROOT_MODULE_DIR}/zramroot-mount.sh"
+    backup_file "${ZRAMROOT_MODULE_DIR}/zramroot-finalize.sh"
+    backup_file "${ROOTFS_BLOCK_DIR}/mount-root.sh"
+    backup_file "/etc/zramroot.conf"
+
+    # Copy zramroot module files
+    print_info "Copying zramroot module files..."
+    cp "dracut/zramroot/module-setup.sh" "${ZRAMROOT_MODULE_DIR}/module-setup.sh"
+    chmod +x "${ZRAMROOT_MODULE_DIR}/module-setup.sh"
+
+    cp "dracut/zramroot/zramroot-mount.sh" "${ZRAMROOT_MODULE_DIR}/zramroot-mount.sh"
+    chmod +x "${ZRAMROOT_MODULE_DIR}/zramroot-mount.sh"
+
+    cp "dracut/zramroot/zramroot-finalize.sh" "${ZRAMROOT_MODULE_DIR}/zramroot-finalize.sh"
+    chmod +x "${ZRAMROOT_MODULE_DIR}/zramroot-finalize.sh"
+
+    # Replace rootfs-block mount-root.sh with our modified version
+    print_info "Installing modified mount-root.sh to ${ROOTFS_BLOCK_DIR}..."
+    cp "dracut/rootfs-block/mount-root.sh" "${ROOTFS_BLOCK_DIR}/mount-root.sh"
+    chmod +x "${ROOTFS_BLOCK_DIR}/mount-root.sh"
+
+    cp "zramroot.conf" "/etc/zramroot.conf"
+
+    # Ensure zram driver is included in initramfs even in hostonly mode
+    print_info "Configuring dracut to include zram driver..."
+    cat > /etc/dracut.conf.d/zramroot.conf <<'EOF'
+add_drivers+=" zram "
+EOF
+
+    print_success "Dracut module files installed successfully!"
+
+    # Rebuild initramfs
+    print_info ""
+    print_info "=== Rebuilding initramfs with dracut ==="
+    print_warning "This may take a minute..."
+
+    # Detect if this is Qubes OS
+    IS_QUBES=0
+    if [ -f "/etc/qubes-release" ] || command -v qubes-dom0-update >/dev/null 2>&1; then
+        IS_QUBES=1
+        print_info "Detected Qubes OS Dom0"
+    fi
+
+    # Rebuild initramfs for all kernels
+    if dracut --force --regenerate-all; then
+        print_success "Initramfs rebuilt successfully!"
+
+        # Verify module was included
+        print_info "Verifying zramroot module inclusion..."
+        if lsinitrd 2>/dev/null | grep -q "zramroot"; then
+            print_success "zramroot module successfully included in initramfs"
+        else
+            print_warning "Could not verify module inclusion (lsinitrd may not be available)"
+            print_info "You can verify manually with: lsinitrd | grep zramroot"
+        fi
+    else
+        print_error "Failed to rebuild initramfs"
+        print_info "You may need to run 'sudo dracut --force --regenerate-all' manually"
+        exit 1
+    fi
+
+    print_success "Dracut configuration completed!"
+
+    # Qubes-specific recommendations
+    if [ $IS_QUBES -eq 1 ]; then
+        echo ""
+        print_info "=== Qubes OS Specific Recommendations ==="
+        print_warning "Qubes Dom0 only sees its assigned RAM. zramroot will use Dom0's memory limit, not total system RAM."
+        print_info "If zramroot reports insufficient RAM, increase Dom0 memory in Qubes settings (e.g., dom0_mem) or set ZRAM_SIZE_MiB manually."
+        print_info "For Dom0 in Qubes OS, consider adding to /etc/zramroot.conf:"
+        print_info "  ZRAM_MOUNT_ON_DISK=\"/var/lib/qubes\""
+        print_info "  ZRAM_PHYSICAL_ROOT_OPTS=\"rw\""
+        print_info "  ZRAM_EXCLUDE_PATTERNS=\"/var/lib/qubes/appvms/* /var/lib/qubes/vm-templates/*\""
+        print_info "  ZRAM_ALGO=\"zstd\""
+        print_info "  RAM_MIN_FREE_MiB=2048"
+        print_info "  DEBUG_MODE=\"yes\"  # Recommended for first boot"
+        echo ""
+    fi
 fi
 
 # Bootloader Configuration
 echo ""
 print_info "=== Bootloader Configuration ==="
-print_info "ZRAMroot requires adding a kernel parameter to your bootloader."
+print_info "${TRIGGER_PARAMETER} requires adding a kernel parameter to your bootloader."
 print_info "You can either:"
 print_info "  1. Let the script automatically configure a bootloader entry"
 print_info "  2. Skip bootloader configuration and do it manually later"
@@ -687,7 +890,7 @@ read -p "Would you like to configure a bootloader entry automatically? (y/n): " 
 
 if [[ ! "$configure_bootloader" =~ ^[Yy]$ ]]; then
     print_info "Skipping bootloader configuration."
-    print_warning "You'll need to manually add 'zramroot' to your kernel parameters."
+    print_warning "You'll need to manually add '${TRIGGER_PARAMETER}' to your kernel parameters."
     bootloader="skip"
 else
     echo ""
@@ -716,10 +919,28 @@ else
     # Enhanced bootloader detection function
     detect_all_bootloaders() {
         local found_bootloaders=()
-        
-        # Check for GRUB
-        if [ -f "/boot/grub/grub.cfg" ] && [ -d "/etc/grub.d" ]; then
-            if command -v update-grub >/dev/null 2>&1 || command -v grub-mkconfig >/dev/null 2>&1; then
+
+        # Check for GRUB (both GRUB and GRUB2)
+        # GRUB can be in multiple locations: /boot/grub/, /boot/grub2/, or /boot/efi/EFI/*/
+        grub_detected=0
+
+        # Check for GRUB config files
+        if [ -f "/boot/grub/grub.cfg" ] || [ -f "/boot/grub2/grub.cfg" ] || \
+           [ -f "/boot/efi/EFI/qubes/grub.cfg" ] || [ -f "/boot/efi/EFI/fedora/grub.cfg" ] || \
+           [ -f "/boot/efi/EFI/centos/grub.cfg" ] || [ -f "/boot/efi/EFI/redhat/grub.cfg" ]; then
+            grub_detected=1
+        fi
+
+        # Also check if /etc/grub.d/ exists (common for all GRUB installations)
+        if [ -d "/etc/grub.d" ]; then
+            grub_detected=1
+        fi
+
+        # Verify GRUB commands are available
+        if [ $grub_detected -eq 1 ]; then
+            if command -v update-grub >/dev/null 2>&1 || \
+               command -v grub-mkconfig >/dev/null 2>&1 || \
+               command -v grub2-mkconfig >/dev/null 2>&1; then
                 found_bootloaders+=("grub")
             fi
         fi
@@ -758,9 +979,14 @@ else
             print_warning "No supported bootloaders detected automatically."
             echo ""
             print_warning "Supported bootloaders:"
-            print_info "  - GRUB (requires /boot/grub/grub.cfg and update-grub command)"
-            print_info "  - systemd-boot (requires /boot/loader/ and bootctl command)" 
+            print_info "  - GRUB/GRUB2 (requires /etc/grub.d/ and grub-mkconfig/grub2-mkconfig)"
+            print_info "  - systemd-boot (requires /boot/loader/ and bootctl command)"
             print_info "  - extlinux/syslinux (requires config files and commands)"
+            echo ""
+            print_info "Note: For GRUB2 systems (Fedora/RHEL/Qubes), the script looks for:"
+            print_info "  - /boot/grub2/grub.cfg or /boot/efi/EFI/qubes/grub.cfg"
+            print_info "  - /etc/grub.d/ directory"
+            print_info "  - grub2-mkconfig command"
             echo ""
             read -p "Continue with manual configuration? (y/n): " continue_manual
             if [[ ! "$continue_manual" =~ ^[Yy]$ ]]; then
@@ -851,49 +1077,39 @@ fi
 if [ "$bootloader" = "grub" ]; then
     print_info "Configuring GRUB..."
 
-    # First, check if a ZRAMroot entry already exists in any grub.d file
+    # Check if 40_zramroot already exists
     existing_zramroot_file=""
-    for grub_file in /etc/grub.d/*_custom; do
-        if [ -f "$grub_file" ] && grep -q "ZRAM Root Custom Entry" "$grub_file"; then
-            existing_zramroot_file="$grub_file"
-            print_info "Found existing ZRAMroot entry in $grub_file"
-            break
-        fi
-    done
+    if [ -f "/etc/grub.d/40_zramroot" ]; then
+        existing_zramroot_file="/etc/grub.d/40_zramroot"
+        print_info "Found existing ${TRIGGER_PARAMETER} entry in $existing_zramroot_file"
+    fi
 
-    # If we found an existing ZRAMroot entry, ask user what to do
+    # If we found an existing zramroot entry, ask user what to do
     if [ -n "$existing_zramroot_file" ]; then
-        print_warning "A ZRAMroot GRUB entry already exists in $existing_zramroot_file"
+        print_warning "A ${TRIGGER_PARAMETER} GRUB entry already exists in $existing_zramroot_file"
         echo ""
         read -p "Do you want to update the existing entry? (y/n): " update_existing
         
         if [[ "$update_existing" =~ ^[Yy]$ ]]; then
             grub_custom_file="$existing_zramroot_file"
-            print_info "Will update existing ZRAMroot entry in $grub_custom_file"
+            print_info "Will update existing ${TRIGGER_PARAMETER} entry in $grub_custom_file"
         else
-            # Find a new available custom file name
-            custom_num=40
-            grub_custom_file="/etc/grub.d/${custom_num}_custom"
-            
-            while [ -f "$grub_custom_file" ]; do
-                print_info "File $grub_custom_file already exists, trying next number..."
-                custom_num=$((custom_num + 1))
-                grub_custom_file="/etc/grub.d/${custom_num}_custom"
-            done
-            
+            grub_custom_file="/etc/grub.d/40_zramroot"
             print_info "Will create new GRUB custom file: $grub_custom_file"
         fi
     else
-        # No existing ZRAMroot entry found, find an available custom file name
-        custom_num=40
-        grub_custom_file="/etc/grub.d/${custom_num}_custom"
-        
-        while [ -f "$grub_custom_file" ]; do
-            print_info "File $grub_custom_file already exists, trying next number..."
-            custom_num=$((custom_num + 1))
-            grub_custom_file="/etc/grub.d/${custom_num}_custom"
-        done
-        
+        # No existing zramroot entry found, use 40_zramroot
+        grub_custom_file="/etc/grub.d/40_zramroot"
+
+        if [ -f "$grub_custom_file" ]; then
+            print_warning "File $grub_custom_file already exists"
+            read -p "Overwrite it? (y/n): " overwrite
+            if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+                print_error "Installation cancelled"
+                exit 1
+            fi
+        fi
+
         print_info "Using GRUB custom file: $grub_custom_file"
     fi
 
@@ -918,8 +1134,18 @@ if [ "$bootloader" = "grub" ]; then
     grub_class=""
     additional_modules=""
 
+    # Check for Qubes OS first (special handling needed for Xen)
+    IS_QUBES_GRUB=0
+    if [ -f "/etc/qubes-release" ]; then
+        IS_QUBES_GRUB=1
+        distro_id="qubes"
+        distro_name="Qubes OS"
+        distro_version=$(cat /etc/qubes-release | grep -oE 'R[0-9.]+')
+        print_info "Detected Qubes OS (Xen-based system)"
+    fi
+
     # Method 1: Try /etc/os-release (most modern systems)
-    if [ -f "/etc/os-release" ]; then
+    if [ -f "/etc/os-release" ] && [ $IS_QUBES_GRUB -eq 0 ]; then
         . /etc/os-release
         distro_id="${ID}"
         distro_name="${NAME}"
@@ -974,6 +1200,11 @@ if [ "$bootloader" = "grub" ]; then
 
     # Set GRUB class and additional modules based on distribution
     case "$distro_id" in
+        "qubes")
+            grub_class="qubes"
+            additional_modules="\tinsmod part_gpt\n\tinsmod ext2"
+            # Qubes uses Xen hypervisor - will need special GRUB entry format
+            ;;
         "ubuntu")
             grub_class="ubuntu"
             additional_modules="\tinsmod part_gpt\n\tinsmod ext2"
@@ -984,7 +1215,7 @@ if [ "$bootloader" = "grub" ]; then
             ;;
         "fedora")
             grub_class="fedora"
-            additional_modules="\tinsmod part_gpt\n\tinsmod ext2\n\tinsmod xfs"
+            additional_modules="\tinsmod part_gpt\n\tinsmod xfs"
             ;;
         "centos"|"rhel")
             grub_class="centos"
@@ -1056,24 +1287,52 @@ esac
 
 print_info "Using GRUB class: $grub_class for $distro_name"
 
-# Try to extract info from existing GRUB config
-grub_config="/boot/grub/grub.cfg"
-if [ -f "$grub_config" ]; then
-    print_info "Analyzing existing GRUB configuration..."
-    
-    # Get current OS name from grub (but prefer our detected name)
-    existing_os_name=$(grep -m1 -oP "menuentry '\K[^']*" "$grub_config" | grep -v "Memory test" | head -1)
-    
-    # Get kernel and initrd paths
-    kernel_path=$(grep -m1 -oP '\tlinux\s+\K[^\s]+' "$grub_config" | head -1)
-    # Get ALL initrd paths (microcode + initramfs), not just the first one
-    initrd_path=$(grep -m1 -oP '\tinitrd\s+\K.*' "$grub_config" | head -1 | sed 's/[[:space:]]*$//')
-    
-    # Check for devicetree
-    if grep -q "devicetree" "$grub_config"; then
-        devicetree_path=$(grep -m1 -oP '\tdevicetree\s+\K[^\s]+' "$grub_config" | head -1)
+# Find the actual GRUB config file
+grub_config=""
+for cfg in /boot/efi/EFI/qubes/grub.cfg /boot/grub2/grub.cfg /boot/grub/grub.cfg /boot/efi/EFI/fedora/grub.cfg /boot/efi/EFI/centos/grub.cfg /boot/efi/EFI/redhat/grub.cfg; do
+    if [ -f "$cfg" ] && [ -r "$cfg" ]; then
+        grub_config="$cfg"
+        print_info "Found GRUB config: $grub_config"
+        break
     fi
-    
+done
+
+if [ -n "$grub_config" ]; then
+    print_info "Analyzing existing GRUB configuration..."
+
+    # Detect if this is a Xen-based entry (Qubes OS)
+    GRUB_ENTRY_TYPE="linux"
+    if grep -q "multiboot2.*xen" "$grub_config"; then
+        GRUB_ENTRY_TYPE="xen"
+        print_info "Detected Xen-based GRUB entries (Qubes OS)"
+    fi
+
+    if [ "$GRUB_ENTRY_TYPE" = "xen" ]; then
+        # Extract Xen-based entry
+        print_info "Extracting existing Xen menuentry..."
+        EXISTING_XEN_ENTRY=$(awk '/menuentry.*Qubes.*Xen/{p=1} p{print} /^}$/ && p{exit}' "$grub_config")
+
+        if [ -n "$EXISTING_XEN_ENTRY" ]; then
+            print_info "Found Xen entry, will create modified version with ${TRIGGER_PARAMETER}"
+        else
+            print_warning "Could not extract Xen entry, will use template"
+        fi
+    else
+        # Standard Linux entry - extract paths
+        # Get current OS name from grub (but prefer our detected name)
+        existing_os_name=$(grep -m1 -oP "menuentry '\K[^']*" "$grub_config" | grep -v "Memory test" | head -1)
+
+        # Get kernel and initrd paths
+        kernel_path=$(grep -m1 -oP '\tlinux\s+\K[^\s]+' "$grub_config" | head -1)
+        # Get ALL initrd paths (microcode + initramfs), not just the first one
+        initrd_path=$(grep -m1 -oP '\tinitrd\s+\K.*' "$grub_config" | head -1 | sed 's/[[:space:]]*$//')
+
+        # Check for devicetree
+        if grep -q "devicetree" "$grub_config"; then
+            devicetree_path=$(grep -m1 -oP '\tdevicetree\s+\K[^\s]+' "$grub_config" | head -1)
+        fi
+    fi
+
     # Extract additional kernel parameters that might be needed
     kernel_params=$(grep -m1 -oP '\tlinux\s+[^\s]+\s+\K.*' "$grub_config" | head -1)
     
@@ -1100,17 +1359,17 @@ fi
 # Create or update custom GRUB file
 print_info "Creating custom GRUB entry with OS: $os_name, UUID: $root_uuid"
 
-# If updating an existing file, preserve non-ZRAMroot content
+# If updating an existing file, preserve non-zramroot content
 if [ -n "$existing_zramroot_file" ] && [ "$grub_custom_file" = "$existing_zramroot_file" ]; then
-    print_info "Updating existing ZRAMroot entry..."
-    
-    # Create temporary file with content before ZRAMroot section
+    print_info "Updating existing ${TRIGGER_PARAMETER} entry..."
+
+    # Create temporary file with content before zramroot section
     temp_file=$(mktemp)
-    if grep -q "# --- ZRAM Root Custom Entry ---" "$grub_custom_file"; then
-        # Extract everything before the ZRAMroot section
-        sed '/# --- ZRAM Root Custom Entry ---/,$d' "$grub_custom_file" > "$temp_file"
+    if grep -q "# --- zramroot" "$grub_custom_file"; then
+        # Extract everything before the zramroot section
+        sed '/# --- zramroot/,$d' "$grub_custom_file" > "$temp_file"
     else
-        # No ZRAMroot section found, keep entire file
+        # No zramroot section found, keep entire file
         cp "$grub_custom_file" "$temp_file"
     fi
     
@@ -1129,7 +1388,7 @@ exec tail -n +3 $0
 EOF
 fi
 
-    # Prepare kernel parameters - preserve important ones and add zramroot
+    # Prepare kernel parameters - preserve important ones and add trigger parameter
     clean_kernel_params=""
     if [ -n "$kernel_params" ]; then
         # Remove root= parameter as we'll add our own, and remove ro/rw as we need rw
@@ -1137,7 +1396,7 @@ fi
     fi
 
     # Build final kernel parameters
-    final_kernel_params="root=UUID=${root_uuid} rw zramroot"
+    final_kernel_params="root=UUID=${root_uuid} rw ${TRIGGER_PARAMETER}"
     if [ -n "$clean_kernel_params" ]; then
         final_kernel_params="$final_kernel_params $clean_kernel_params"
     fi
@@ -1157,46 +1416,185 @@ fi
     print_info "Root UUID: $root_uuid"
     echo ""
 
-    # Add the ZRAMroot section with distribution-specific formatting
-    cat >> "$grub_custom_file" << EOF
-# --- ZRAM Root Custom Entry ---
+    # Copy the first menuentry from grub.cfg and add trigger parameter
+    if [ -n "$grub_config" ] && [ -f "$grub_config" ]; then
+        print_info "Extracting first boot entry from $grub_config..."
 
-menuentry '${os_name} (Load Root to ZRAM)' --class ${grub_class} --class gnu-linux --class gnu --class os {
-	recordfail
-	load_video
-	gfxmode \$linux_gfx_mode
-	insmod gzio
-	if [ x\$grub_platform = xxen ]; then insmod xzio; insmod lzopio; fi
+        # Extract the entire first menuentry
+        FIRST_ENTRY=$(awk '/^menuentry /{p=1} p{print} /^}$/ && p{exit}' "$grub_config")
+
+        if [ -n "$FIRST_ENTRY" ]; then
+            # Change the title
+            MODIFIED_ENTRY=$(echo "$FIRST_ENTRY" | sed "s/menuentry '[^']*'/menuentry '${TRIGGER_PARAMETER}'/")
+
+            # Add trigger parameter to kernel line (works for both 'linux' and 'module2' commands)
+            MODIFIED_ENTRY=$(echo "$MODIFIED_ENTRY" | sed "/\(linux\|module2\).*vmlinuz/s/vmlinuz[^ ]*/& ${TRIGGER_PARAMETER}/")
+
+            # --- Qubes OS: Dom0 Memory Adjustment ---
+            # Check if this is Qubes OS by looking for dom0_mem parameter
+            if echo "$MODIFIED_ENTRY" | grep -q "dom0_mem"; then
+                # Extract current max memory setting
+                current_dom0_max=$(echo "$MODIFIED_ENTRY" | grep -o "dom0_mem=[^[:space:]]*" | grep -o "max:[0-9]*" | cut -d: -f2)
+                
+                # If cannot find max: syntax, try just simple integer (rare but possible)
+                if [ -z "$current_dom0_max" ]; then
+                    current_dom0_max=$(echo "$MODIFIED_ENTRY" | grep -o "dom0_mem=[0-9]*[kMGT]*" | sed 's/dom0_mem=//')
+                fi
+
+                if [ -n "$current_dom0_max" ]; then
+                    echo ""
+                    print_info "Qubes OS detected: dom0_mem configuration found."
+                    print_info "Current dom0 memory limit: ${current_dom0_max}MB"
+                    print_warning "${TRIGGER_PARAMETER} loads the entire root filesystem into RAM."
+                    print_warning "Standard Qubes dom0 limits (often 4096MB) may be insufficient."
+                    
+                    read -p "Would you like to increase dom0 memory for the ${TRIGGER_PARAMETER} entry? (Recommended: 8192) (y/n): " increase_mem
+                    
+                    if [[ "$increase_mem" =~ ^[Yy]$ ]]; then
+                        read -p "Enter new max memory in MB (default: 8192): " new_mem
+                        if [ -z "$new_mem" ]; then
+                            new_mem=8192
+                        fi
+                        
+                        if [[ "$new_mem" =~ ^[0-9]+$ ]]; then
+                            print_info "Updating dom0_mem to max:${new_mem}M for ${TRIGGER_PARAMETER} entry..."
+                            # Replace dom0_mem=... with new value
+                            # This handles the complex multiboot/module syntax of Xen/Qubes
+                            # And handles cases with multiple dom0_mem parameters (e.g. min/max split)
+                            MODIFIED_ENTRY=$(echo "$MODIFIED_ENTRY" | sed "s/dom0_mem=[^[:space:]]*/__DOM0_MEM_PLACEHOLDER__/")
+                            MODIFIED_ENTRY=$(echo "$MODIFIED_ENTRY" | sed "s/dom0_mem=[^[:space:]]*//g")
+                            MODIFIED_ENTRY=$(echo "$MODIFIED_ENTRY" | sed "s/__DOM0_MEM_PLACEHOLDER__/dom0_mem=min:1024M,max:${new_mem}M/")
+                        else
+                            print_error "Invalid number, skipping memory adjustment."
+                        fi
+                    fi
+                fi
+            fi
+            # --- End Qubes OS Memory Adjustment ---
+
+            # Write the custom entry
+            cat > "$grub_custom_file" << 'HEADER'
+#!/bin/sh
+exec tail -n +3 $0
+# This file provides an easy way to add custom menu entries.
+# Simply type the menu entries you want to add after this comment.
+
+HEADER
+
+            cat >> "$grub_custom_file" << EOF
+# --- zramroot Boot Entry ---
+# Auto-generated by install.sh on $(date)
+
+$MODIFIED_ENTRY
+
+# --- END zramroot Entry ---
 EOF
 
-    # Add the additional modules with proper formatting
-    echo -e "$additional_modules" >> "$grub_custom_file"
+            chmod +x "$grub_custom_file"
 
-    # Continue with the rest of the entry
-    cat >> "$grub_custom_file" << EOF
-	search --no-floppy --fs-uuid --set=root ${root_uuid}
-	linux	${kernel_path} ${final_kernel_params}
-	initrd	${initrd_path}
-EOF
+            print_success "Created GRUB entry in $grub_custom_file"
 
-    # Add devicetree line if it exists in current config
-    if [ -n "$devicetree_path" ]; then
-        echo "	devicetree	${devicetree_path}" >> "$grub_custom_file"
+            # Verify trigger parameter was added
+            if grep -q "${TRIGGER_PARAMETER}" "$grub_custom_file"; then
+                print_success "✓ ${TRIGGER_PARAMETER} parameter added"
+            else
+                print_warning "Could not add ${TRIGGER_PARAMETER} parameter automatically"
+                print_info "Please manually add '${TRIGGER_PARAMETER}' to the kernel line in $grub_custom_file"
+            fi
+        else
+            print_error "Could not extract menuentry from $grub_config"
+            print_info "Please manually create a GRUB entry in $grub_custom_file"
+        fi
+    else
+        print_error "Could not find GRUB config file"
+        print_info "Please manually create a GRUB entry in /etc/grub.d/40_zramroot"
     fi
-
-    # Finish the menuentry
-    echo "}" >> "$grub_custom_file"
-    echo "" >> "$grub_custom_file"
-    echo "# --- END ZRAM Root Custom Entry ---" >> "$grub_custom_file"
 
     # Make the file executable
     chmod +x "$grub_custom_file"
 
     # Update GRUB configuration
     print_info "Updating GRUB configuration..."
-    if ! update-grub; then
-        print_error "Failed to update GRUB configuration."
-        print_info "You may need to run 'update-grub' manually."
+
+    # Try update-grub first (Debian/Ubuntu)
+    if command -v update-grub >/dev/null 2>&1; then
+        if ! update-grub; then
+            print_error "Failed to update GRUB configuration."
+            print_info "You may need to run 'update-grub' manually."
+        fi
+    # Try grub2-mkconfig (Fedora/RHEL/Qubes OS)
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then
+        # For RHEL-based systems, we may need to update multiple configs
+        # Detect all possible GRUB config locations
+        grub_configs=()
+
+        # Check EFI locations first (these are usually the ones actually used for EFI boot)
+        if [ -f "/boot/efi/EFI/qubes/grub.cfg" ]; then
+            grub_configs+=("/boot/efi/EFI/qubes/grub.cfg")
+        fi
+        if [ -f "/boot/efi/EFI/fedora/grub.cfg" ]; then
+            grub_configs+=("/boot/efi/EFI/fedora/grub.cfg")
+        fi
+        if [ -f "/boot/efi/EFI/centos/grub.cfg" ]; then
+            grub_configs+=("/boot/efi/EFI/centos/grub.cfg")
+        fi
+        if [ -f "/boot/efi/EFI/redhat/grub.cfg" ]; then
+            grub_configs+=("/boot/efi/EFI/redhat/grub.cfg")
+        fi
+
+        # Check /boot locations
+        if [ -f "/boot/grub2/grub.cfg" ]; then
+            grub_configs+=("/boot/grub2/grub.cfg")
+        fi
+        # Some systems have grub.cfg in /boot/grub/ even with grub2
+        if [ -f "/boot/grub/grub.cfg" ]; then
+            grub_configs+=("/boot/grub/grub.cfg")
+        fi
+
+        if [ ${#grub_configs[@]} -eq 0 ]; then
+            print_error "Could not find any GRUB2 config files"
+            print_info "Please run 'grub2-mkconfig' manually to update your GRUB configuration"
+        else
+            print_info "Found ${#grub_configs[@]} GRUB config file(s) to update:"
+            for cfg in "${grub_configs[@]}"; do
+                print_info "  - $cfg"
+            done
+            echo ""
+
+            # Update each config file
+            for grub_cfg in "${grub_configs[@]}"; do
+                print_info "Generating GRUB config at: $grub_cfg"
+                if grub2-mkconfig -o "$grub_cfg"; then
+                    print_success "Successfully updated: $grub_cfg"
+                else
+                    print_error "Failed to update: $grub_cfg"
+                    print_info "You may need to run 'sudo grub2-mkconfig -o $grub_cfg' manually"
+                fi
+            done
+        fi
+    # Try grub-mkconfig (Arch)
+    elif command -v grub-mkconfig >/dev/null 2>&1; then
+        if ! grub-mkconfig -o /boot/grub/grub.cfg; then
+            print_error "Failed to update GRUB configuration."
+            print_info "You may need to run 'sudo grub-mkconfig -o /boot/grub/grub.cfg' manually."
+        fi
+    else
+        print_error "Could not find GRUB configuration command (update-grub, grub2-mkconfig, or grub-mkconfig)"
+        print_info "Please update your GRUB configuration manually."
+    fi
+
+    # Verify and show the entry
+    echo ""
+    if [ -f "$grub_custom_file" ] && grep -q "${TRIGGER_PARAMETER}" "$grub_custom_file" 2>/dev/null; then
+        print_success "✓ ${TRIGGER_PARAMETER} entry created in $grub_custom_file"
+
+        echo ""
+        print_info "Generated GRUB entry preview:"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        grep -A 20 "^menuentry" "$grub_custom_file" | head -25
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    else
+        print_warning "Could not verify ${TRIGGER_PARAMETER} entry"
     fi
 
 elif [ "$bootloader" = "systemd-boot" ]; then
@@ -1245,21 +1643,21 @@ elif [ "$bootloader" = "systemd-boot" ]; then
         fi
     fi
     
-    # Clean kernel parameters and add zramroot
+    # Clean kernel parameters and add trigger parameter
     clean_kernel_params=""
     if [ -n "$existing_kernel_params" ]; then
         # Remove root= parameter as we'll add our own, and remove ro/rw as we need rw
         clean_kernel_params=$(echo "$existing_kernel_params" | sed -e 's/root=[^[:space:]]*//g' -e 's/\bro\b//g' -e 's/\brw\b//g' -e 's/[[:space:]]\+/ /g' -e 's/^[[:space:]]*//g' -e 's/[[:space:]]*$//g')
     fi
-    
+
     # Build final kernel parameters
-    final_kernel_params="root=UUID=${root_uuid} rw zramroot"
+    final_kernel_params="root=UUID=${root_uuid} rw ${TRIGGER_PARAMETER}"
     if [ -n "$clean_kernel_params" ]; then
         final_kernel_params="$final_kernel_params $clean_kernel_params"
     fi
-    
+
     # Create systemd-boot entry
-    entry_file="/boot/loader/entries/zramroot.conf"
+    entry_file="/boot/loader/entries/${TRIGGER_PARAMETER}.conf"
     
     print_info "Creating systemd-boot entry: $entry_file"
     print_info "Kernel: $kernel_file"
@@ -1268,7 +1666,7 @@ elif [ "$bootloader" = "systemd-boot" ]; then
     
     # Check if entry already exists
     if [ -f "$entry_file" ]; then
-        print_warning "ZRAMroot systemd-boot entry already exists at $entry_file"
+        print_warning "${TRIGGER_PARAMETER} systemd-boot entry already exists at $entry_file"
         read -p "Do you want to update the existing entry? (y/n): " update_existing
         
         if [[ ! "$update_existing" =~ ^[Yy]$ ]]; then
@@ -1288,7 +1686,7 @@ elif [ "$bootloader" = "systemd-boot" ]; then
         fi
         
         cat > "$entry_file" << EOF
-title   ${distro_name} (ZRAMroot)
+title   ${distro_name} (${TRIGGER_PARAMETER})
 version ${kernel_version}
 linux   /${kernel_file}
 initrd  /${initrd_file}
@@ -1358,29 +1756,29 @@ elif [ "$bootloader" = "extlinux" ]; then
         existing_kernel_params=$(grep -m1 "APPEND" "$config_file" | sed 's/.*APPEND[[:space:]]*//' | head -1)
     fi
     
-    # Clean kernel parameters and add zramroot
+    # Clean kernel parameters and add trigger parameter
     clean_kernel_params=""
     if [ -n "$existing_kernel_params" ]; then
         # Remove root= parameter as we'll add our own, and remove ro/rw as we need rw
         clean_kernel_params=$(echo "$existing_kernel_params" | sed -e 's/root=[^[:space:]]*//g' -e 's/\bro\b//g' -e 's/\brw\b//g' -e 's/[[:space:]]\+/ /g' -e 's/^[[:space:]]*//g' -e 's/[[:space:]]*$//g')
     fi
-    
+
     # Build final kernel parameters
-    final_kernel_params="root=UUID=${root_uuid} rw zramroot"
+    final_kernel_params="root=UUID=${root_uuid} rw ${TRIGGER_PARAMETER}"
     if [ -n "$clean_kernel_params" ]; then
         final_kernel_params="$final_kernel_params $clean_kernel_params"
     fi
-    
+
     print_info "Configuration file: $config_file"
     print_info "Kernel: $kernel_file"
     print_info "Initrd: $initrd_file"
     print_info "Parameters: $final_kernel_params"
-    
-    # Check if ZRAMroot entry already exists
-    zramroot_exists=false
-    if [ -f "$config_file" ] && grep -q "ZRAMroot" "$config_file"; then
-        zramroot_exists=true
-        print_warning "ZRAMroot entry already exists in $config_file"
+
+    # Check if trigger parameter entry already exists
+    trigger_entry_exists=false
+    if [ -f "$config_file" ] && grep -q "${TRIGGER_PARAMETER}" "$config_file"; then
+        trigger_entry_exists=true
+        print_warning "${TRIGGER_PARAMETER} entry already exists in $config_file"
         read -p "Do you want to update the existing entry? (y/n): " update_existing
         
         if [[ ! "$update_existing" =~ ^[Yy]$ ]]; then
@@ -1388,10 +1786,10 @@ elif [ "$bootloader" = "extlinux" ]; then
         fi
     fi
     
-    if [ "$zramroot_exists" = false ] || [[ "$update_existing" =~ ^[Yy]$ ]]; then
+    if [ "$trigger_entry_exists" = false ] || [[ "$update_existing" =~ ^[Yy]$ ]]; then
         # Create directory if needed
         mkdir -p "$(dirname "$config_file")"
-        
+
         # Get distribution name for label
         if [ -f "/etc/os-release" ]; then
             . /etc/os-release
@@ -1399,19 +1797,19 @@ elif [ "$bootloader" = "extlinux" ]; then
         else
             distro_name="Linux"
         fi
-        
-        if [ "$zramroot_exists" = true ]; then
-            # Remove existing ZRAMroot entry
-            sed -i '/# ZRAMroot Entry/,/^$/d' "$config_file"
-            print_info "Removed existing ZRAMroot entry."
+
+        if [ "$trigger_entry_exists" = true ]; then
+            # Remove existing trigger parameter entry
+            sed -i "/# ${TRIGGER_PARAMETER} Entry/,/^$/d" "$config_file"
+            print_info "Removed existing ${TRIGGER_PARAMETER} entry."
         fi
-        
-        # Add new ZRAMroot entry
+
+        # Add new trigger parameter entry
         cat >> "$config_file" << EOF
 
-# ZRAMroot Entry
-LABEL zramroot
-  MENU LABEL ${distro_name} (ZRAMroot)
+# ${TRIGGER_PARAMETER} Entry
+LABEL ${TRIGGER_PARAMETER}
+  MENU LABEL ${distro_name} (${TRIGGER_PARAMETER})
   KERNEL ${kernel_file}
   APPEND ${final_kernel_params}
   INITRD ${initrd_file}
@@ -1434,9 +1832,9 @@ EOF
 elif [ "$bootloader" = "manual" ]; then
     print_warning "Manual bootloader configuration required!"
     echo ""
-    print_info "To use ZRAMroot with your bootloader, you need to:"
+    print_info "To use ${TRIGGER_PARAMETER} with your bootloader, you need to:"
     print_info "1. Create a new boot entry that loads the same kernel and initramfs"
-    print_info "2. Add 'zramroot' to the kernel command line parameters"
+    print_info "2. Add '${TRIGGER_PARAMETER}' to the kernel command line parameters"
     echo ""
     
     # Get root UUID for manual configuration
@@ -1446,7 +1844,7 @@ elif [ "$bootloader" = "manual" ]; then
                 blkid -s UUID -o value $(findmnt -no SOURCE /))
     
     print_info "Your root UUID is: ${root_uuid}"
-    print_info "Example kernel parameters: root=UUID=${root_uuid} rw zramroot"
+    print_info "Example kernel parameters: root=UUID=${root_uuid} rw ${TRIGGER_PARAMETER}"
     echo ""
 
 elif [ "$bootloader" = "skip" ]; then
@@ -1459,9 +1857,9 @@ elif [ "$bootloader" = "skip" ]; then
                 blkid -s UUID -o value $(findmnt -no SOURCE /))
     
     echo ""
-    print_warning "To enable ZRAMroot, you'll need to manually add 'zramroot' to your kernel parameters."
+    print_warning "To enable ${TRIGGER_PARAMETER}, you'll need to manually add '${TRIGGER_PARAMETER}' to your kernel parameters."
     print_info "Your root UUID is: ${root_uuid}"
-    print_info "Example kernel parameters: root=UUID=${root_uuid} rw zramroot"
+    print_info "Example kernel parameters: root=UUID=${root_uuid} rw ${TRIGGER_PARAMETER}"
 
 fi
 
@@ -1475,39 +1873,103 @@ if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
 fi
 
 print_header
-print_success "ZRAMroot installation completed!"
+print_success "zramroot installation completed!"
 echo ""
 
 if [ "$INIT_SYSTEM" = "initramfs-tools" ]; then
     # Display bootloader-specific success messages
     case "$bootloader" in
         "grub")
-            print_info "A new GRUB menu entry has been added: '${os_name} (Load Root to ZRAM)'"
-            print_info "You can select this entry at boot time to use ZRAMroot."
+            print_info "A new GRUB menu entry has been added: '${TRIGGER_PARAMETER}'"
+            print_info "You can select this entry at boot time to use ${TRIGGER_PARAMETER}."
             ;;
         "systemd-boot")
-            print_info "A new systemd-boot entry has been added: '${distro_name} (ZRAMroot)'"
-            print_info "You can select this entry at boot time to use ZRAMroot."
+            print_info "A new systemd-boot entry has been added: '${distro_name} (${TRIGGER_PARAMETER})'"
+            print_info "You can select this entry at boot time to use ${TRIGGER_PARAMETER}."
             ;;
         "extlinux")
-            print_info "A new extlinux/syslinux entry has been added: '${distro_name} (ZRAMroot)'"
-            print_info "You can select this entry at boot time to use ZRAMroot."
+            print_info "A new extlinux/syslinux entry has been added: '${distro_name} (${TRIGGER_PARAMETER})'"
+            print_info "You can select this entry at boot time to use ${TRIGGER_PARAMETER}."
             ;;
         "manual")
             print_warning "Manual bootloader configuration is required!"
-            print_info "Please create a boot entry with the 'zramroot' kernel parameter."
+            print_info "Please create a boot entry with the '${TRIGGER_PARAMETER}' kernel parameter."
             ;;
         "skip")
             print_info "Bootloader configuration was skipped."
-            print_warning "Remember to manually add 'zramroot' to your kernel parameters when ready."
+            print_warning "Remember to manually add '${TRIGGER_PARAMETER}' to your kernel parameters when ready."
             ;;
     esac
     echo ""
     print_info "Configuration file is located at: /etc/zramroot.conf"
-    print_info "You can edit this file to change ZRAMroot settings."
+    print_info "You can edit this file to change zramroot settings."
     echo ""
     print_warning "Remember that after modifying the configuration, you need to update the initramfs:"
     print_info "  sudo update-initramfs -u -k all"
+fi
+
+if [ "$INIT_SYSTEM" = "dracut" ]; then
+    # Display bootloader-specific success messages for dracut systems
+    if [ -f "/etc/qubes-release" ]; then
+        # Qubes OS specific messages
+        print_info "=== Next Steps for Qubes OS ==="
+        echo ""
+        print_info "1. Configure /etc/zramroot.conf with recommended settings:"
+        print_info "   ZRAM_MOUNT_ON_DISK=\"/var/lib/qubes\""
+        print_info "   ZRAM_PHYSICAL_ROOT_OPTS=\"rw\""
+        print_info "   DEBUG_MODE=\"yes\""
+        echo ""
+        print_info "2. Reboot and select '${TRIGGER_PARAMETER}' from GRUB menu"
+    else
+        # Standard dracut system (Fedora/RHEL)
+        case "$bootloader" in
+            "grub")
+                print_info "A new GRUB menu entry '${TRIGGER_PARAMETER}' has been added"
+                print_info "Select this entry at boot time to use ${TRIGGER_PARAMETER}"
+                ;;
+            "systemd-boot")
+                print_info "A new systemd-boot entry has been added"
+                print_info "Select this entry at boot time to use ${TRIGGER_PARAMETER}"
+                ;;
+            "manual"|"skip")
+                print_warning "Add '${TRIGGER_PARAMETER}' to your kernel parameters manually"
+                ;;
+        esac
+    fi
+    echo ""
+    print_info "Configuration file is located at: /etc/zramroot.conf"
+    print_info "You can edit this file to change zramroot settings."
+    echo ""
+    print_warning "Remember that after modifying the configuration, you need to rebuild initramfs:"
+    print_info "  sudo dracut --force --regenerate-all"
+fi
+
+if [ "$INIT_SYSTEM" = "mkinitcpio" ]; then
+    # Display bootloader-specific success messages for Arch systems
+    case "$bootloader" in
+        "grub")
+            print_info "A new GRUB menu entry has been added: '${TRIGGER_PARAMETER}'"
+            print_info "You can select this entry at boot time to use ${TRIGGER_PARAMETER}."
+            ;;
+        "systemd-boot")
+            print_info "A new systemd-boot entry has been added: '${distro_name} (${TRIGGER_PARAMETER})'"
+            print_info "You can select this entry at boot time to use ${TRIGGER_PARAMETER}."
+            ;;
+        "manual")
+            print_warning "Manual bootloader configuration is required!"
+            print_info "Please create a boot entry with the '${TRIGGER_PARAMETER}' kernel parameter."
+            ;;
+        "skip")
+            print_info "Bootloader configuration was skipped."
+            print_warning "Remember to manually add '${TRIGGER_PARAMETER}' to your kernel parameters when ready."
+            ;;
+    esac
+    echo ""
+    print_info "Configuration file is located at: /etc/zramroot.conf"
+    print_info "You can edit this file to change zramroot settings."
+    echo ""
+    print_warning "Remember that after modifying the configuration, you need to rebuild initramfs:"
+    print_info "  sudo mkinitcpio -P"
 fi
 
 echo ""

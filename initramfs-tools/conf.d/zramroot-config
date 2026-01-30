@@ -1,29 +1,46 @@
-# Configuration for ZRAM Root Boot with persistent logging
+# Configuration for ZRAM Root Boot
 
 # --- Debugging ---
-# Enable verbose logging to the physical root partition at /var/log/zramroot.log
+# Enable verbose logging to /var/log/zramroot-*.log (default)
 DEBUG_MODE="no"
+
+# Directory for zramroot debug logs.
+# Default: /var/log (on the physical root once mounted)
+# Example (unencrypted /boot): DEBUG_LOG_DIR="/boot"
+DEBUG_LOG_DIR="/var/log"
+
+# Optional: device to mount for DEBUG_LOG_DIR (e.g., UUID=xxxx-xxxx)
+# Use this when DEBUG_LOG_DIR is on a separate, unencrypted partition.
+# Example: DEBUG_LOG_DEVICE="UUID=BOOT-UUID"
+DEBUG_LOG_DEVICE=""
 
 # --- ZRAM Device Settings ---
 # Manually specify ZRAM device size in MiB.
 # If set to 0, size will be calculated automatically.
 ZRAM_SIZE_MiB=0
 
-# Compression algorithm (e.g., lz4, zstd, lzo-rle).
+# Compression algorithm
+# Options: lz4, lz4hc, zstd, lzo, lzo-rle
+# Recommendations:
+#   - lz4: Fast compression/decompression, moderate compression ratio (default)
+#   - zstd: Best compression ratio, slightly slower
+#   - lzo: Fastest, lowest compression ratio
 ZRAM_ALGO="lz4"
 
-# Filesystem type for ZRAM device (e.g., ext4, btrfs, xfs)
+# Filesystem type for ZRAM device
+# Options: ext4, btrfs, xfs
+# Note: Make sure the necessary tools are installed
 ZRAM_FS_TYPE="ext4"
 
 # Mount options for the ZRAM filesystem
-ZRAM_MOUNT_OPTS="rw,noatime"
+ZRAM_MOUNT_OPTS="noatime"
 
 # --- RAM Management Settings ---
 # Minimum amount of RAM (in MiB) to leave free after allocating ZRAM
 RAM_MIN_FREE_MiB=512
 
 # Preferred amount of RAM (in MiB) to leave free after allocating ZRAM
-RAM_PREF_FREE_MiB=512
+RAM_PREF_FREE_MiB=1024
 
 # Minimum ZRAM space (in MiB) to leave free for growth
 ZRAM_MIN_FREE_MiB=256
@@ -32,17 +49,19 @@ ZRAM_MIN_FREE_MiB=256
 ZRAM_MAX_FREE_MiB=35840
 
 # --- Resource Calculation (Used only if ZRAM_SIZE_MiB is 0) ---
-# Buffer percentage to add to the original used size when calculating ZRAM size automatically.
+# Buffer percentage to add to the original used size when calculating ZRAM size
 ZRAM_BUFFER_PERCENT=10
 
 # --- ZRAM Swap Settings ---
 # Enable ZRAM-based swap to replace original drive swap partitions
+# This is recommended when using ZRAMroot to allow disconnecting the physical drive
 ZRAM_SWAP_ENABLED="yes"
 
 # ZRAM swap device number (usually 1, since 0 is used for root)
 ZRAM_SWAP_DEVICE_NUM=1
 
 # ZRAM swap size in MiB (0 = auto-calculate based on system RAM)
+# Auto-calculation uses 25% of total RAM, capped at 4GB, minimum 512MB
 ZRAM_SWAP_SIZE_MiB=0
 
 # ZRAM swap compression algorithm (should match or be compatible with root ZRAM)
@@ -51,12 +70,40 @@ ZRAM_SWAP_ALGO="lz4"
 # Priority for ZRAM swap (higher numbers = higher priority, default swap is usually 0)
 ZRAM_SWAP_PRIORITY=10
 
+# --- Include/Exclude Patterns ---
+# Patterns to exclude from ZRAM copy (space-separated, supports wildcards)
+# Examples:
+#   ZRAM_EXCLUDE_PATTERNS="/var/lib/qubes/appvms/* /var/lib/qubes/vm-templates/* /var/cache/* *.iso"
+# Note: These are in addition to the default exclusions (/dev, /proc, /sys, /tmp, /run, /mnt, /media, /lost+found)
+ZRAM_EXCLUDE_PATTERNS=""
+
+# Patterns to explicitly include (overrides excludes, space-separated)
+# Only needed if you want to include something that would otherwise be excluded
+ZRAM_INCLUDE_PATTERNS=""
+
+# --- Mount-on-Disk (Bind Mounts from Physical Storage) ---
+# Directories to exclude from ZRAM but mount from physical disk after boot (space-separated)
+# These directories will be created as empty directories in ZRAM, then bind-mounted
+# from the physical root partition. Physical root will remain mounted at /mnt/physical_root
+# Examples:
+#   ZRAM_MOUNT_ON_DISK="/var/lib/qubes /home"  # For Qubes OS: keep VM storage on disk
+#   ZRAM_MOUNT_ON_DISK="/var/lib/docker"       # For Docker: keep containers on disk
+# Note: Paths listed here are automatically added to ZRAM_EXCLUDE_PATTERNS
+ZRAM_MOUNT_ON_DISK=""
+
+# Mount options for physical root when using ZRAM_MOUNT_ON_DISK
+# Default is "rw" (read-write). Use "ro" if you do not need write access.
+ZRAM_PHYSICAL_ROOT_OPTS="rw"
+
 # --- Advanced (Usually leave as default) ---
 # ZRAM Device Number (usually 0)
+# IMPORTANT: ZRAM_DEVICE_NUM and ZRAM_SWAP_DEVICE_NUM must be different values!
+# If they are the same, one device will fail to be created.
 ZRAM_DEVICE_NUM=0
 
-# Kernel parameter word to trigger ZRAM boot (no '=' needed)
+# Kernel parameter word to trigger ZRAM boot
+# For mkinitcpio, the hook runs automatically if added to HOOKS
 TRIGGER_PARAMETER="zramroot"
 
 # Seconds to wait for the real root device to appear
-WAIT_TIMEOUT=5
+WAIT_TIMEOUT=120

@@ -4,14 +4,16 @@
 # --- Global Variables ---
 CONFIG_FILE="/conf/zramroot-config" 
 DEBUG_MODE="no" # Will be loaded from config
+DEBUG_LOG_DIR="/var/log"
+DEBUG_LOG_DEVICE=""
 REAL_ROOT_DEVICE="" # Will be set from ROOT environment variable
 REAL_ROOT_MNT="/mnt/real_root_rw"  # For persistent logging and copying
 DATE_TIME=$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo "unknown") # Generate log filename with date/time
-REAL_ROOT_LOG_DIR="${REAL_ROOT_MNT}/var/log"
+REAL_ROOT_LOG_DIR="${REAL_ROOT_MNT}${DEBUG_LOG_DIR}"
 REAL_ROOT_LOG_FILE="${REAL_ROOT_LOG_DIR}/zramroot-${DATE_TIME}.log"
 ZRAM_DEVICE="zram0"
 TRIGGER_PARAMETER="zramroot" # Default trigger word
-WAIT_TIMEOUT=5 # Seconds to wait for the real root device
+WAIT_TIMEOUT=120 # Seconds to wait for the real root device
 ZRAM_DEVICE_NUM=0
 ZRAM_SIZE_MiB=0
 ZRAM_ALGO="lz4"
@@ -19,12 +21,12 @@ ZRAM_FS_TYPE="ext4"
 ZRAM_MOUNT_OPTS="noatime"
 RAM_MIN_FREE_MiB=512   # Minimum RAM to leave free after ZRAM allocation
 ZRAM_MIN_FREE_MiB=256   # Minimum ZRAM to leave free for growth
-RAM_PREF_FREE_MiB=512  # Preferred RAM to leave free
+RAM_PREF_FREE_MiB=1024  # Preferred RAM to leave free
 ZRAM_MAX_FREE_MiB=35840  # Maximum ZRAM to leave free for growth
 ESTIMATED_COMPRESSION_RATIO=2.5
 ZRAM_BUFFER_PERCENT=10
 BOOT_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "unknown")
-ZRAM_TEMP_MNT="/tmp/zram_temp" # Use a temporary mount point in /tmp
+ZRAM_TEMP_MNT="/zram_root" # Temporary mount point for ZRAM (consistent across all implementations)
 
 # --- Enhanced Logging Functions ---
 log_kernel() { 
@@ -103,30 +105,69 @@ draw_progress_bar() {
     fi
 }
 
+# Function to build rsync exclude/include flags from configuration
+build_rsync_filters() {
+    local filters=""
+
+    # Add user-specified include patterns first (they take precedence)
+    if [ -n "$ZRAM_INCLUDE_PATTERNS" ]; then
+        log_debug "Processing include patterns: $ZRAM_INCLUDE_PATTERNS"
+        for pattern in $ZRAM_INCLUDE_PATTERNS; do
+            filters="$filters --include=$pattern"
+            log_debug "  Include: $pattern"
+        done
+    fi
+
+    # Add mount-on-disk paths to exclude patterns (they'll be bind-mounted later)
+    local exclude_patterns="$ZRAM_EXCLUDE_PATTERNS"
+    if [ -n "$ZRAM_MOUNT_ON_DISK" ]; then
+        log_debug "Adding mount-on-disk paths to exclusions: $ZRAM_MOUNT_ON_DISK"
+        for mount_path in $ZRAM_MOUNT_ON_DISK; do
+            # Remove leading/trailing slashes for consistency
+            mount_path=$(echo "$mount_path" | sed 's:^/::; s:/$::')
+            if [ -n "$mount_path" ]; then
+                exclude_patterns="$exclude_patterns /$mount_path /$mount_path/*"
+                log_debug "  Excluding (will bind-mount): /$mount_path"
+            fi
+        done
+    fi
+
+    # Add user-specified exclude patterns
+    if [ -n "$exclude_patterns" ]; then
+        log_debug "Processing exclude patterns: $exclude_patterns"
+        for pattern in $exclude_patterns; do
+            filters="$filters --exclude=$pattern"
+            log_debug "  Exclude: $pattern"
+        done
+    fi
+
+    echo "$filters"
+}
+
 # Function to detect optimal number of parallel operations
 detect_optimal_threads() {
     local cpu_cores=$(nproc 2>/dev/null || echo "1")
     local available_ram_mb=$(($(grep MemAvailable /proc/meminfo | awk '{print $2}') / 1024))
-    
+
     # Start with CPU core count
     local optimal_threads=$cpu_cores
-    
+
     # Adjust based on available RAM (each rsync process uses ~50-100MB)
     local max_ram_threads=$((available_ram_mb / 75))  # Conservative estimate
     if [ "$max_ram_threads" -lt "$optimal_threads" ]; then
         optimal_threads=$max_ram_threads
     fi
-    
+
     # Ensure we have at least 1 thread and no more than 16 (diminishing returns)
     if [ "$optimal_threads" -lt 1 ]; then
         optimal_threads=1
     elif [ "$optimal_threads" -gt 16 ]; then
         optimal_threads=16
     fi
-    
+
     log_debug "Detected ${cpu_cores} CPU cores, ${available_ram_mb}MB RAM"
     log_debug "Using ${optimal_threads} parallel rsync operations"
-    
+
     echo "$optimal_threads"
 }
 
@@ -236,10 +277,17 @@ copy_with_parallel_progress() {
     
     # Create work distribution
     local work_dir=$(create_work_distribution "$source" "$thread_count")
-    
-    # Common rsync options
+
+    # Common rsync options - default exclusions
     local RSYNC_EXCLUDE="--exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found --exclude=/var/log/journal/*"
-    
+
+    # Add user-configured filters (includes and excludes)
+    local USER_FILTERS=$(build_rsync_filters)
+    if [ -n "$USER_FILTERS" ]; then
+        log_info "Applying user-configured include/exclude filters"
+        RSYNC_EXCLUDE="$RSYNC_EXCLUDE $USER_FILTERS"
+    fi
+
     # Display header
     echo ""
     echo ""
@@ -258,28 +306,50 @@ copy_with_parallel_progress() {
     for i in $(seq 0 $((thread_count - 1))); do
         local job_file="${work_dir}/job_${i}.list"
         local job_log="${work_dir}/job_${i}.log"
-        
+
         if [ -s "$job_file" ]; then
             # Start rsync job in background
             (
                 # Process each directory/file in this job
                 while read item; do
-                    if [ "$item" = "ROOT_FILES" ]; then
-                        # Copy root level files and symlinks (excluding directories that are handled separately)
-                        rsync -ax \
-                              --include="/*" --exclude="/*/" \
-                              --exclude="/dev" --exclude="/proc" --exclude="/sys" --exclude="/tmp" \
-                              --exclude="/run" --exclude="/mnt" --exclude="/media" --exclude="/lost+found" \
-                              "${source}/" "${dest}/" 2>>"$job_log"
-                    else
-                        # Copy specific directory
-                        mkdir -p "${dest}/${item}"
-                        rsync -ax --delete \
-                              "${source}/${item}/" "${dest}/${item}/" 2>>"$job_log"
-                    fi
+                    rsync_exit=1
+                    retry_count=0
+                    max_retries=3
+
+                    while [ $rsync_exit -ne 0 ] && [ $retry_count -lt $max_retries ]; do
+                        if [ "$item" = "ROOT_FILES" ]; then
+                            # Copy root level files and symlinks (excluding directories that are handled separately)
+                            # shellcheck disable=SC2086
+                            rsync -ax \
+                                  --include="/*" --exclude="/*/" \
+                                  --exclude="/dev" --exclude="/proc" --exclude="/sys" --exclude="/tmp" \
+                                  --exclude="/run" --exclude="/mnt" --exclude="/media" --exclude="/lost+found" \
+                                  $USER_FILTERS \
+                                  "${source}/" "${dest}/" 2>>"$job_log"
+                            rsync_exit=$?
+                        else
+                            # Copy specific directory
+                            mkdir -p "${dest}/${item}"
+                            # shellcheck disable=SC2086
+                            rsync -ax --delete \
+                                  $RSYNC_EXCLUDE \
+                                  "${source}/${item}/" "${dest}/${item}/" 2>>"$job_log"
+                            rsync_exit=$?
+                        fi
+
+                        if [ $rsync_exit -ne 0 ]; then
+                            retry_count=$((retry_count + 1))
+                            if [ $retry_count -lt $max_retries ]; then
+                                echo "Retry $retry_count/$max_retries for $item" >> "$job_log"
+                                sleep 1
+                            else
+                                echo "FAILED after $max_retries retries: $item (exit code: $rsync_exit)" >> "$job_log"
+                            fi
+                        fi
+                    done
                 done < "$job_file"
             ) &
-            
+
             local job_pid=$!
             echo "$job_pid" > "${work_dir}/job_${i}.pid"
             log_debug "Started rsync job ${i} with PID ${job_pid}"
@@ -406,6 +476,70 @@ copy_with_progress() {
     copy_with_parallel_progress "$@"
 }
 
+# Function to wait for a device to appear (supports encrypted devices)
+# Usage: wait_for_device <device_spec> <timeout_seconds>
+# Returns: 0 if device found, 1 if timeout
+# Sets: RESOLVED_DEVICE to the resolved block device path
+wait_for_device() {
+    local device_spec="$1"
+    local timeout="${2:-$WAIT_TIMEOUT}"
+    local elapsed=0
+    local interval=1
+
+    RESOLVED_DEVICE=""
+
+    log_info "Waiting for device ${device_spec} (timeout: ${timeout}s)..."
+
+    while [ $elapsed -lt $timeout ]; do
+        # Try to resolve the device
+        local resolved=""
+
+        # Handle UUID=, LABEL=, PARTUUID= formats
+        if echo "${device_spec}" | grep -q "^UUID=\|^LABEL=\|^PARTUUID="; then
+            if command -v blkid >/dev/null 2>&1; then
+                resolved=$(blkid -l -t "${device_spec}" -o device 2>/dev/null)
+            fi
+        # Handle /dev/mapper/* paths (common for encrypted devices)
+        elif echo "${device_spec}" | grep -q "^/dev/mapper/"; then
+            if [ -b "${device_spec}" ]; then
+                resolved="${device_spec}"
+            fi
+        # Handle /dev/disk/by-* paths
+        elif echo "${device_spec}" | grep -q "^/dev/disk/"; then
+            if [ -L "${device_spec}" ]; then
+                resolved=$(readlink -f "${device_spec}" 2>/dev/null)
+                if [ ! -b "$resolved" ]; then
+                    resolved=""
+                fi
+            fi
+        # Handle direct /dev/* paths
+        elif [ "${device_spec#/dev/}" != "${device_spec}" ]; then
+            if [ -b "${device_spec}" ]; then
+                resolved="${device_spec}"
+            fi
+        fi
+
+        # Check if we found a valid block device
+        if [ -n "$resolved" ] && [ -b "$resolved" ]; then
+            RESOLVED_DEVICE="$resolved"
+            log_info "Device ${device_spec} found as ${RESOLVED_DEVICE} after ${elapsed}s"
+            return 0
+        fi
+
+        # Wait and increment counter
+        sleep $interval
+        elapsed=$((elapsed + interval))
+
+        # Log progress every 10 seconds
+        if [ $((elapsed % 10)) -eq 0 ]; then
+            log_debug "Still waiting for ${device_spec}... (${elapsed}s/${timeout}s)"
+        fi
+    done
+
+    log_error "Timeout waiting for device ${device_spec} after ${timeout}s"
+    return 1
+}
+
 # Function to setup ZRAM swap
 setup_zram_swap() {
     log_debug "Setting up ZRAM swap device ${ZRAM_SWAP_DEVICE_NUM}"
@@ -481,14 +615,37 @@ setup_zram_swap() {
     fi
 }
 
-# Check if zramroot parameter is in cmdline before doing anything
-log_kernel "Checking for zramroot parameter in kernel cmdline"
-if ! echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
-    log_debug "No zramroot parameter found - exiting quietly"
+# Load TRIGGER_PARAMETER and WAIT_TIMEOUT from config early (before the check)
+# We need to source the config to get these values before proceeding
+CONFIG_FILE="/conf/zramroot-config"
+if [ -f "${CONFIG_FILE}" ]; then
+    # Extract TRIGGER_PARAMETER value safely
+    trigger_setting=$(grep "^TRIGGER_PARAMETER=" "${CONFIG_FILE}" 2>/dev/null | cut -d'"' -f2)
+    if [ -n "${trigger_setting}" ]; then
+        TRIGGER_PARAMETER="${trigger_setting}"
+    fi
+    # Extract WAIT_TIMEOUT value safely
+    timeout_setting=$(grep "^WAIT_TIMEOUT=" "${CONFIG_FILE}" 2>/dev/null | cut -d'=' -f2)
+    if [ -n "${timeout_setting}" ]; then
+        WAIT_TIMEOUT="${timeout_setting}"
+    fi
+fi
+
+# Check if trigger parameter is in cmdline before doing anything
+log_kernel "Checking for ${TRIGGER_PARAMETER} parameter in kernel cmdline"
+if ! echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]${TRIGGER_PARAMETER}[[:space:]]"; then
+    log_debug "No ${TRIGGER_PARAMETER} parameter found - exiting quietly"
     exit 0
 fi
 
-log_kernel "zramroot parameter found - starting setup"
+log_kernel "${TRIGGER_PARAMETER} parameter found - starting setup"
+
+# --- Validate device number configuration ---
+if [ "$ZRAM_DEVICE_NUM" -eq "$ZRAM_SWAP_DEVICE_NUM" ] && [ "$ZRAM_SWAP_ENABLED" = "yes" ]; then
+    log_info "ZRAM_DEVICE_NUM ($ZRAM_DEVICE_NUM) equals ZRAM_SWAP_DEVICE_NUM ($ZRAM_SWAP_DEVICE_NUM)"
+    log_info "Automatically adjusting ZRAM_SWAP_DEVICE_NUM to $((ZRAM_SWAP_DEVICE_NUM + 1))"
+    ZRAM_SWAP_DEVICE_NUM=$((ZRAM_SWAP_DEVICE_NUM + 1))
+fi
 
 # Create necessary directories
 mkdir -p /mnt
@@ -496,30 +653,16 @@ mkdir -p /tmp
 mkdir -p "${ZRAM_TEMP_MNT}"
 
 # Try to mount physical root for logging and file copying
+# This is critical for encrypted devices - we need to wait for decryption to complete
 REAL_ROOT_DEVICE="${ROOT}"
 if [ -n "${REAL_ROOT_DEVICE}" ]; then
     log_debug "Attempting to mount physical root ${REAL_ROOT_DEVICE} for logging and copying"
     mkdir -p "${REAL_ROOT_MNT}"
-    
-    # Wait a bit for device to be ready
-    sleep 2
-    
-    # Try to find the real device
-    real_dev=""
-    
-    # First try resolving UUID/LABEL style devices
-    if echo "${REAL_ROOT_DEVICE}" | grep -q "^UUID=\|^LABEL="; then
-        if command -v blkid >/dev/null 2>&1; then
-            real_dev=$(blkid -l -t "${REAL_ROOT_DEVICE}" -o device 2>/dev/null)
-            log_debug "Resolved ${REAL_ROOT_DEVICE} to ${real_dev}"
-        fi
-    # Handle direct device paths
-    elif [ "${REAL_ROOT_DEVICE#/dev/}" != "${REAL_ROOT_DEVICE}" ] && [ -b "${REAL_ROOT_DEVICE}" ]; then
-        real_dev="${REAL_ROOT_DEVICE}"
-        log_debug "Using direct device path: ${real_dev}"
-    fi
-    
-    if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
+
+    # Wait for the root device to appear (handles encrypted devices that need time to unlock)
+    # Uses WAIT_TIMEOUT from config (default 120 seconds)
+    if wait_for_device "${REAL_ROOT_DEVICE}" "${WAIT_TIMEOUT}"; then
+        real_dev="${RESOLVED_DEVICE}"
         log_debug "Attempting to mount ${real_dev} at ${REAL_ROOT_MNT}"
         if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
             # Ensure log directory exists
@@ -532,25 +675,48 @@ if [ -n "${REAL_ROOT_DEVICE}" ]; then
             log_error "Failed to mount physical root device ${real_dev}"
         fi
     else
-        log_error "Could not find physical root device: ${REAL_ROOT_DEVICE}"
+        log_error "Timeout waiting for physical root device: ${REAL_ROOT_DEVICE}"
+        log_error "This may indicate the device doesn't exist or encryption unlock failed"
     fi
 fi
 
-# Load configuration
-DEBUG_MODE="no"; ZRAM_SIZE_MiB=0; ZRAM_ALGO="zstd"; ZRAM_FS_TYPE="ext4"
-ZRAM_MOUNT_OPTS="defaults,noatime"; RAM_MIN_FREE_MiB=512
+# Load configuration - these defaults match zramroot.conf exactly
+DEBUG_MODE="no"; DEBUG_LOG_DIR="/var/log"; DEBUG_LOG_DEVICE=""
+ZRAM_SIZE_MiB=0; ZRAM_ALGO="lz4"; ZRAM_FS_TYPE="ext4"
+ZRAM_MOUNT_OPTS="noatime"; RAM_MIN_FREE_MiB=512
 ZRAM_BUFFER_PERCENT=10
-ZRAM_DEVICE_NUM=0; TRIGGER_PARAMETER="zramroot"; WAIT_TIMEOUT=5
+ZRAM_DEVICE_NUM=0; TRIGGER_PARAMETER="zramroot"; WAIT_TIMEOUT=120
 RAM_PREF_FREE_MiB=1024; ZRAM_MIN_FREE_MiB=256; ZRAM_MAX_FREE_MiB=35840
 # ZRAM Swap defaults
 ZRAM_SWAP_ENABLED="yes"; ZRAM_SWAP_DEVICE_NUM=1; ZRAM_SWAP_SIZE_MiB=0
 ZRAM_SWAP_ALGO="lz4"; ZRAM_SWAP_PRIORITY=10
+# Include/Exclude and Mount-on-Disk defaults
+ZRAM_EXCLUDE_PATTERNS=""; ZRAM_INCLUDE_PATTERNS=""
+ZRAM_MOUNT_ON_DISK=""; ZRAM_PHYSICAL_ROOT_OPTS="rw"
 
 if [ -f "${CONFIG_FILE}" ]; then
     log_debug "Loading configuration from ${CONFIG_FILE}"
     . "${CONFIG_FILE}"
     log_debug "Configuration loaded - DEBUG_MODE=${DEBUG_MODE}"
 fi
+
+# Sanity-check debug log directory to avoid mounting over initramfs root
+if [ -z "${DEBUG_LOG_DIR}" ] || [ "${DEBUG_LOG_DIR}" = "/" ]; then
+    log_kernel "zramroot: DEBUG_LOG_DIR is empty or '/', forcing /var/log"
+    DEBUG_LOG_DIR="/var/log"
+fi
+
+# Update log paths after loading config
+if [ -n "${DEBUG_LOG_DEVICE}" ]; then
+    mkdir -p "${DEBUG_LOG_DIR}" 2>/dev/null || true
+    if ! mountpoint -q "${DEBUG_LOG_DIR}" 2>/dev/null; then
+        mount -o rw "${DEBUG_LOG_DEVICE}" "${DEBUG_LOG_DIR}" 2>/dev/null || true
+    fi
+    REAL_ROOT_LOG_DIR="${DEBUG_LOG_DIR}"
+else
+    REAL_ROOT_LOG_DIR="${REAL_ROOT_MNT}${DEBUG_LOG_DIR}"
+fi
+REAL_ROOT_LOG_FILE="${REAL_ROOT_LOG_DIR}/zramroot-${DATE_TIME}.log"
 
 # Set algorithm-specific compression estimates based on empirical testing
 # These are not user-configurable as ZRAM doesn't allow tuning compression levels
@@ -658,8 +824,28 @@ if ! lsmod | grep -q '^zram '; then
     }
 fi
 
-# Wait for ZRAM device node to appear
-sleep 3
+# Wait for ZRAM control interface with polling
+log_info "Waiting for ZRAM control interface..."
+zram_wait=0
+zram_max_wait=30
+while [ $zram_wait -lt $zram_max_wait ]; do
+    if [ -e /sys/class/zram-control ] || [ -e "/sys/block/zram${ZRAM_DEVICE_NUM}" ]; then
+        log_debug "ZRAM control interface available after ${zram_wait}s"
+        break
+    fi
+    sleep 1
+    zram_wait=$((zram_wait + 1))
+    if [ $((zram_wait % 5)) -eq 0 ]; then
+        log_debug "Still waiting for ZRAM control interface... (${zram_wait}s/${zram_max_wait}s)"
+    fi
+done
+
+if [ ! -e /sys/class/zram-control ] && [ ! -e "/sys/block/zram${ZRAM_DEVICE_NUM}" ]; then
+    log_error "ZRAM control interface not available after ${zram_max_wait}s"
+    log_error "Ensure kernel has CONFIG_ZRAM enabled and zram module is in initramfs"
+    exit 1
+fi
+
 if command -v udevadm >/dev/null && [ -x "$(command -v udevadm)" ]; then
     udevadm settle || log_debug "udev settle failed or not available"
 fi
@@ -698,12 +884,25 @@ else
     fi
 fi
 
-# Wait a bit more for device to be ready
-sleep 2
+# Wait for ZRAM device to be ready with polling
+log_debug "Waiting for ZRAM device ${ZRAM_DEVICE} to be ready..."
+zram_dev_wait=0
+zram_dev_max_wait=30
+while [ $zram_dev_wait -lt $zram_dev_max_wait ]; do
+    if [ -b "${ZRAM_DEVICE}" ]; then
+        log_debug "ZRAM device ${ZRAM_DEVICE} ready after ${zram_dev_wait}s"
+        break
+    fi
+    sleep 1
+    zram_dev_wait=$((zram_dev_wait + 1))
+    if [ $((zram_dev_wait % 5)) -eq 0 ]; then
+        log_debug "Still waiting for ${ZRAM_DEVICE}... (${zram_dev_wait}s/${zram_dev_max_wait}s)"
+    fi
+done
 
 # Verify ZRAM device exists
 if [ ! -b "${ZRAM_DEVICE}" ]; then
-    log_error "ZRAM device does not exist after configuration!"
+    log_error "ZRAM device ${ZRAM_DEVICE} does not exist after ${zram_dev_max_wait}s!"
     exit 1
 fi
 
@@ -715,14 +914,29 @@ mkfs_cmd="mkfs.${ZRAM_FS_TYPE}"
 mkfs_opts=""
 
 if ! command -v ${mkfs_cmd} >/dev/null; then
-    log_error "Filesystem utility ${mkfs_cmd} not found in initramfs!"
+    case "${ZRAM_FS_TYPE}" in
+        ext4)
+            log_error "mkfs.ext4 not found in initramfs! Install e2fsprogs and run: sudo update-initramfs -u -k all"
+            ;;
+        btrfs)
+            log_error "mkfs.btrfs not found in initramfs! Install btrfs-progs and run: sudo update-initramfs -u -k all"
+            ;;
+        xfs)
+            log_error "mkfs.xfs not found in initramfs! Install xfsprogs and run: sudo update-initramfs -u -k all"
+            ;;
+        *)
+            log_error "Filesystem utility ${mkfs_cmd} not found in initramfs!"
+            ;;
+    esac
     exit 1
 fi
 
 # Add specific options for filesystem types
-if [ "$ZRAM_FS_TYPE" = "ext4" ]; then 
+if [ "$ZRAM_FS_TYPE" = "ext4" ]; then
     mkfs_opts="-F"
 elif [ "$ZRAM_FS_TYPE" = "btrfs" ]; then
+    mkfs_opts="-f"
+elif [ "$ZRAM_FS_TYPE" = "xfs" ]; then
     mkfs_opts="-f"
 fi
 
@@ -782,7 +996,46 @@ if mount -t "${ZRAM_FS_TYPE}" -o "rw,${ZRAM_MOUNT_OPTS}" "${ZRAM_DEVICE}" "${ZRA
                 rm -f "$temp_fstab" "$temp_fstab.2" "$temp_fstab.3" "$temp_fstab.4" "$temp_fstab.5" "$temp_fstab.6"
                 
                 log_debug "Successfully modified /etc/fstab"
-                
+
+                # Setup mount-on-disk bind mounts if configured
+                if [ -n "$ZRAM_MOUNT_ON_DISK" ]; then
+                    log_info "Configuring mount-on-disk directories..."
+
+                    # Add the physical root mount itself to fstab so systemd knows about it
+                    echo "" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+                    echo "# ZRAMROOT: Physical root mount (required for bind mounts)" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+                    local phys_opts="${ZRAM_PHYSICAL_ROOT_OPTS:-rw}"
+                    echo "${REAL_ROOT_DEVICE} /mnt/physical_root auto ${phys_opts},nofail 0 0" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+                    log_debug "Added physical root mount entry to /etc/fstab: ${REAL_ROOT_DEVICE} -> /mnt/physical_root"
+
+                    for mount_path in $ZRAM_MOUNT_ON_DISK; do
+                        # Clean up path (remove leading/trailing slashes)
+                        mount_path=$(echo "$mount_path" | sed 's:^/::; s:/$::')
+
+                        if [ -z "$mount_path" ]; then
+                            continue
+                        fi
+
+                        # Check if directory exists on physical root
+                        if [ -d "${REAL_ROOT_MNT}/${mount_path}" ]; then
+                            # Create empty directory in ZRAM root
+                            mkdir -p "${ZRAM_TEMP_MNT}/${mount_path}"
+                            log_debug "Created mount point /${mount_path} in ZRAM root"
+
+                            # Add bind mount entry to fstab
+                            echo "" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+                            echo "# ZRAMROOT: Bind mount from physical disk" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+                            echo "/mnt/physical_root/${mount_path} /${mount_path} none bind 0 0" >> "${ZRAM_TEMP_MNT}/etc/fstab"
+                            log_info "Added bind mount for /${mount_path} from physical disk"
+                        else
+                            log_error "Warning: Mount-on-disk path /${mount_path} does not exist on physical root - skipping"
+                        fi
+                    done
+
+                    # Mark that we need to keep physical root mounted
+                    export ZRAMROOT_KEEP_PHYSICAL_MOUNTED="yes"
+                fi
+
                 # Setup ZRAM swap if enabled
                 if [ "${ZRAM_SWAP_ENABLED}" = "yes" ]; then
                     log_info "Setting up ZRAM swap..."
@@ -851,9 +1104,17 @@ cleanup_lvm2() {
             local vg_name=""
             
             # Try to extract VG name from device path
+            # Note: LVM uses single dash to separate VG-LV names, double dash for literal dashes
             if echo "${root_dev}" | grep -q "/dev/mapper/"; then
-                # Extract VG name from mapper path like /dev/mapper/vg0-root
-                vg_name=$(echo "${root_dev}" | sed 's|/dev/mapper/\([^-]*\)-.*|\1|')
+                # Try lvs first for accurate VG name (handles dashes correctly)
+                local dm_name=$(basename "${root_dev}")
+                if command -v lvs >/dev/null 2>&1; then
+                    vg_name=$(lvs --noheadings -o vg_name "/dev/mapper/${dm_name}" 2>/dev/null | tr -d ' ')
+                fi
+                # Fallback to regex if lvs didn't work (common case: VG has no dashes)
+                if [ -z "$vg_name" ]; then
+                    vg_name=$(echo "${root_dev}" | sed 's|/dev/mapper/\([^-]*\)-.*|\1|')
+                fi
             elif echo "${root_dev}" | grep -q "/dev/.*/"; then
                 # Extract VG name from LVM path like /dev/vg0/root
                 vg_name=$(echo "${root_dev}" | sed 's|/dev/\([^/]*\)/.*|\1|')
@@ -897,14 +1158,44 @@ cleanup_lvm2() {
     fi
 }
 
-# Cleanup physical root mount if we mounted it
+# Handle physical root mount based on mount-on-disk configuration
 if [ -d "${REAL_ROOT_MNT}" ] && mountpoint -q "${REAL_ROOT_MNT}"; then
-    log_debug "Unmounting physical root"
-    sync
-    umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
-    
-    # After unmounting, try to deactivate LVM2 volumes
-    cleanup_lvm2
+    if [ "${ZRAMROOT_KEEP_PHYSICAL_MOUNTED}" = "yes" ]; then
+        # Move physical root mount to /mnt/physical_root for bind mounts
+        log_info "Keeping physical root mounted at /mnt/physical_root for bind mounts"
+
+        # Create the new mount point in initramfs
+        mkdir -p /mnt/physical_root
+
+        # Determine mount options (default to read-only for safety)
+        local phys_mount_opts="${ZRAM_PHYSICAL_ROOT_OPTS:-ro}"
+        log_debug "Physical root will be mounted with options: ${phys_mount_opts}"
+
+        # Remount at new location with specified options
+        # First unmount from temp location
+        sync
+        umount "${REAL_ROOT_MNT}" 2>/dev/null || umount -l "${REAL_ROOT_MNT}" 2>/dev/null || true
+
+        # Mount at final location
+        mount -o "${phys_mount_opts}" "${REAL_ROOT_DEVICE}" /mnt/physical_root || {
+            log_error "Failed to remount physical root at /mnt/physical_root"
+            log_error "Bind mounts will not work!"
+        }
+
+        log_info "Physical root remounted successfully"
+
+        # Export variable for init scripts to know physical root is mounted
+        export ZRAMROOT_PHYSICAL_ROOT="/mnt/physical_root"
+        echo "ZRAMROOT_PHYSICAL_ROOT=/mnt/physical_root" >> /conf/zramroot_vars
+    else
+        # No mount-on-disk configured, unmount physical root as normal
+        log_debug "Unmounting physical root (no mount-on-disk configured)"
+        sync
+        umount "${REAL_ROOT_MNT}" || umount -l "${REAL_ROOT_MNT}" || true
+
+        # After unmounting, try to deactivate LVM2 volumes
+        cleanup_lvm2
+    fi
 fi
 
 exit 0

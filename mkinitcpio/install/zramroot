@@ -51,6 +51,8 @@ build() {
 
 # --- Debugging ---
 DEBUG_MODE="no"
+DEBUG_LOG_DIR="/var/log"
+DEBUG_LOG_DEVICE=""
 
 # --- ZRAM Device Settings ---
 ZRAM_SIZE_MiB=0
@@ -72,8 +74,19 @@ ZRAM_SWAP_SIZE_MiB=0
 ZRAM_SWAP_ALGO="lz4"
 ZRAM_SWAP_PRIORITY=10
 
+# --- Include/Exclude Patterns ---
+ZRAM_EXCLUDE_PATTERNS=""
+ZRAM_INCLUDE_PATTERNS=""
+
+# --- Mount-on-Disk (Bind Mounts from Physical Storage) ---
+ZRAM_MOUNT_ON_DISK=""
+ZRAM_PHYSICAL_ROOT_OPTS="rw"
+
 # --- Advanced ---
+# IMPORTANT: ZRAM_DEVICE_NUM and ZRAM_SWAP_DEVICE_NUM must be different values!
 ZRAM_DEVICE_NUM=0
+TRIGGER_PARAMETER="zramroot"
+WAIT_TIMEOUT=120
 EOF
     fi
 
@@ -102,32 +115,44 @@ EOF
     add_module zram
     add_module ext4
 
-    # Parse config for compression algorithm and add appropriate modules
+    # Parse config for compression algorithms and add appropriate modules
     ZRAM_ALGO="lz4"
+    ZRAM_SWAP_ALGO="lz4"
     if [ -f /etc/zramroot.conf ]; then
         algo=$(grep "^ZRAM_ALGO=" /etc/zramroot.conf | cut -d'"' -f2)
         [ -n "$algo" ] && ZRAM_ALGO="$algo"
+        swap_algo=$(grep "^ZRAM_SWAP_ALGO=" /etc/zramroot.conf | cut -d'"' -f2)
+        [ -n "$swap_algo" ] && ZRAM_SWAP_ALGO="$swap_algo"
     fi
 
-    case "${ZRAM_ALGO}" in
-        zstd)
-            add_module zstd
-            ;;
-        lz4|lz4hc)
-            add_module lz4
-            add_module lz4_compress
-            ;;
-        lzo|lzo-rle)
-            add_module lzo
-            add_module lzo_compress
-            ;;
-        *)
-            # Add all common compression modules for compatibility
-            add_module lz4
-            add_module lzo
-            add_module zstd
-            ;;
-    esac
+    # Helper function to add modules for a compression algorithm
+    add_compression_modules() {
+        case "$1" in
+            zstd)
+                add_module zstd
+                ;;
+            lz4|lz4hc)
+                add_module lz4
+                add_module lz4_compress
+                ;;
+            lzo|lzo-rle)
+                add_module lzo
+                add_module lzo_compress
+                ;;
+            *)
+                # Add all common compression modules for compatibility
+                add_module lz4
+                add_module lzo
+                add_module zstd
+                ;;
+        esac
+    }
+
+    # Add modules for both root ZRAM and swap ZRAM algorithms
+    add_compression_modules "${ZRAM_ALGO}"
+    if [ "${ZRAM_SWAP_ALGO}" != "${ZRAM_ALGO}" ]; then
+        add_compression_modules "${ZRAM_SWAP_ALGO}"
+    fi
 
     # Add the hook script
     add_runscript

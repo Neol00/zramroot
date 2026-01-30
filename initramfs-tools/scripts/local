@@ -1,8 +1,11 @@
 # Local filesystem mounting			-*- shell-script -*-
 # shellcheck shell=sh
 
-# Load DEBUG_MODE from configuration
+# Load configuration values
 DEBUG_MODE="no" # Default value
+DEBUG_LOG_DIR="/var/log" # Default log directory
+DEBUG_LOG_DEVICE="" # Optional separate device for logs
+TRIGGER_PARAMETER="zramroot" # Default trigger parameter
 CONFIG_FILE="/conf/zramroot-config"
 if [ -f "${CONFIG_FILE}" ]; then
     # Extract DEBUG_MODE value safely
@@ -10,49 +13,120 @@ if [ -f "${CONFIG_FILE}" ]; then
     if [ "${debug_setting}" = "yes" ]; then
         DEBUG_MODE="yes"
     fi
+    # Extract DEBUG_LOG_DIR value safely
+    log_dir_setting=$(grep "^DEBUG_LOG_DIR=" "${CONFIG_FILE}" | cut -d'"' -f2)
+    if [ -n "${log_dir_setting}" ]; then
+        DEBUG_LOG_DIR="${log_dir_setting}"
+    fi
+    # Extract DEBUG_LOG_DEVICE value safely
+    log_device_setting=$(grep "^DEBUG_LOG_DEVICE=" "${CONFIG_FILE}" | cut -d'"' -f2)
+    if [ -n "${log_device_setting}" ]; then
+        DEBUG_LOG_DEVICE="${log_device_setting}"
+    fi
+    # Extract TRIGGER_PARAMETER value safely
+    trigger_setting=$(grep "^TRIGGER_PARAMETER=" "${CONFIG_FILE}" | cut -d'"' -f2)
+    if [ -n "${trigger_setting}" ]; then
+        TRIGGER_PARAMETER="${trigger_setting}"
+    fi
+fi
+
+# Sanity-check debug log directory to avoid mounting over initramfs root
+if [ -z "${DEBUG_LOG_DIR}" ] || [ "${DEBUG_LOG_DIR}" = "/" ]; then
+    DEBUG_LOG_DIR="/var/log"
 fi
 
 # --- Enhanced Logging Functions ---
 # Variables for physical root logging
 REAL_ROOT_MNT="/mnt/real_root_rw"
-DATE_TIME=$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo "unknown") 
-REAL_ROOT_LOG_FILE="${REAL_ROOT_MNT}/var/log/zramroot-local-${DATE_TIME}.log"
+DATE_TIME=$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo "unknown")
 
-# Function to ensure physical root is mounted for logging
-ensure_physical_root_mounted() {
-    # Only attempt if not already mounted and we're in zramroot mode
-    if [ ! -d "${REAL_ROOT_MNT}" ] || ! mountpoint -q "${REAL_ROOT_MNT}"; then
-        if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
-            mkdir -p "${REAL_ROOT_MNT}"
-            
-            # Try to get the original root device from environment or cmdline
-            local orig_root="${ROOT}"
-            if [ -z "$orig_root" ]; then
-                # Extract from kernel command line
-                orig_root=$(cat /proc/cmdline | grep -oE 'root=[^[:space:]]+' | cut -d'=' -f2)
-            fi
-            
-            if [ -n "$orig_root" ]; then
-                # Resolve the device if it's UUID/LABEL format
-                local real_dev=""
-                if echo "${orig_root}" | grep -q "^UUID=\|^LABEL="; then
-                    if command -v blkid >/dev/null 2>&1; then
-                        real_dev=$(blkid -l -t "${orig_root}" -o device 2>/dev/null)
-                    fi
-                elif [ "${orig_root#/dev/}" != "${orig_root}" ] && [ -b "${orig_root}" ]; then
-                    real_dev="${orig_root}"
+# Determine log file path based on DEBUG_LOG_DEVICE setting
+if [ -n "${DEBUG_LOG_DEVICE}" ]; then
+    # Log to a separate device (e.g., unencrypted /boot partition)
+    REAL_ROOT_LOG_DIR="${DEBUG_LOG_DIR}"
+    REAL_ROOT_LOG_FILE="${REAL_ROOT_LOG_DIR}/zramroot-local-${DATE_TIME}.log"
+else
+    # Log to the physical root's log directory
+    REAL_ROOT_LOG_DIR="${REAL_ROOT_MNT}${DEBUG_LOG_DIR}"
+    REAL_ROOT_LOG_FILE="${REAL_ROOT_LOG_DIR}/zramroot-local-${DATE_TIME}.log"
+fi
+
+# Function to ensure log destination is available for logging
+ensure_log_destination_mounted() {
+    # Only attempt if we're in zramroot mode
+    if ! echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]${TRIGGER_PARAMETER}[[:space:]]"; then
+        return
+    fi
+
+    # Case 1: DEBUG_LOG_DEVICE is set - mount separate device for logging
+    if [ -n "${DEBUG_LOG_DEVICE}" ]; then
+        if [ ! -d "${DEBUG_LOG_DIR}" ] || ! mountpoint -q "${DEBUG_LOG_DIR}" 2>/dev/null; then
+            mkdir -p "${DEBUG_LOG_DIR}" 2>/dev/null || true
+
+            # Resolve the device if it's UUID/LABEL format
+            local log_dev=""
+            if echo "${DEBUG_LOG_DEVICE}" | grep -q "^UUID=\|^LABEL="; then
+                if command -v blkid >/dev/null 2>&1; then
+                    log_dev=$(blkid -l -t "${DEBUG_LOG_DEVICE}" -o device 2>/dev/null)
                 fi
-                
-                # Try to mount the physical root
-                if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
-                    if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
-                        mkdir -p "${REAL_ROOT_MNT}/var/log"
-                        touch "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+            elif [ "${DEBUG_LOG_DEVICE#/dev/}" != "${DEBUG_LOG_DEVICE}" ]; then
+                log_dev="${DEBUG_LOG_DEVICE}"
+            else
+                # Assume it's a UUID/LABEL without prefix
+                if command -v blkid >/dev/null 2>&1; then
+                    log_dev=$(blkid -l -t "UUID=${DEBUG_LOG_DEVICE}" -o device 2>/dev/null)
+                    if [ -z "$log_dev" ]; then
+                        log_dev=$(blkid -l -t "LABEL=${DEBUG_LOG_DEVICE}" -o device 2>/dev/null)
                     fi
+                fi
+            fi
+
+            # Try to mount the log device
+            if [ -n "$log_dev" ] && [ -b "$log_dev" ]; then
+                if mount -o rw "$log_dev" "${DEBUG_LOG_DIR}" 2>/dev/null; then
+                    touch "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
+                fi
+            fi
+        fi
+        return
+    fi
+
+    # Case 2: No DEBUG_LOG_DEVICE - mount physical root for logging
+    if [ ! -d "${REAL_ROOT_MNT}" ] || ! mountpoint -q "${REAL_ROOT_MNT}"; then
+        mkdir -p "${REAL_ROOT_MNT}"
+
+        # Try to get the original root device from environment or cmdline
+        local orig_root="${ROOT}"
+        if [ -z "$orig_root" ]; then
+            # Extract from kernel command line
+            orig_root=$(cat /proc/cmdline | grep -oE 'root=[^[:space:]]+' | cut -d'=' -f2)
+        fi
+
+        if [ -n "$orig_root" ]; then
+            # Resolve the device if it's UUID/LABEL format
+            local real_dev=""
+            if echo "${orig_root}" | grep -q "^UUID=\|^LABEL="; then
+                if command -v blkid >/dev/null 2>&1; then
+                    real_dev=$(blkid -l -t "${orig_root}" -o device 2>/dev/null)
+                fi
+            elif [ "${orig_root#/dev/}" != "${orig_root}" ] && [ -b "${orig_root}" ]; then
+                real_dev="${orig_root}"
+            fi
+
+            # Try to mount the physical root
+            if [ -n "$real_dev" ] && [ -b "$real_dev" ]; then
+                if mount -o rw "$real_dev" "${REAL_ROOT_MNT}" 2>/dev/null; then
+                    mkdir -p "${REAL_ROOT_LOG_DIR}"
+                    touch "${REAL_ROOT_LOG_FILE}" 2>/dev/null || true
                 fi
             fi
         fi
     fi
+}
+
+# Backwards compatibility alias
+ensure_physical_root_mounted() {
+    ensure_log_destination_mounted
 }
 
 # Logs to the physical root log file if available
@@ -313,10 +387,10 @@ local_device_setup()
 
 local_mount_root()
 {
-    # Check if zramroot parameter exists
-    if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]zramroot[[:space:]]"; then
+    # Check if trigger parameter exists (configurable, default: zramroot)
+    if echo " $(cat /proc/cmdline) " | grep -q "[[:space:]]${TRIGGER_PARAMETER}[[:space:]]"; then
         # --- ZRAM Root Path ---
-        log_begin_msg "Detected zramroot parameter, attempting ZRAM mount"
+        log_begin_msg "Detected ${TRIGGER_PARAMETER} parameter, attempting ZRAM mount"
         zram_log "ZRAM root mount process starting"
         
         # Ensure the premount scripts have run
@@ -346,9 +420,15 @@ local_mount_root()
                 ZRAMROOT_FSTYPE="ext4"
                 ZRAMROOT_ROOTFLAGS="rw,noatime"
             else
-                panic "ZRAMROOT Error: No ZRAM device found!"
+                zram_log "ERROR: No ZRAM device found, falling back to normal boot"
+                # Fall through to standard root mounting below
+                # by pretending the trigger parameter wasn't set
+                log_end_msg 1
             fi
         fi
+
+        # Only proceed with ZRAM mount if we have a valid device
+        if [ -n "${ZRAMROOT_DEVICE}" ] && [ -b "${ZRAMROOT_DEVICE}" ]; then
 
         zram_log "Using ZRAM device: ${ZRAMROOT_DEVICE}"
         zram_log "Using ZRAM FSTYPE: ${ZRAMROOT_FSTYPE}"
@@ -374,29 +454,62 @@ local_mount_root()
         zram_log "Mounting ZRAM root ${ROOT} on ${rootmnt}"
         
         # Try mounting with different option formats
-        if ! mount ${roflag} -t "${FSTYPE}" -o "${ROOTFLAGS}" "${ROOT}" "${rootmnt}"; then
-            zram_log "WARNING: First mount attempt failed, trying fallback 1..."
-            
-            if ! mount ${roflag} -t "${FSTYPE}" -o "rw,noatime" "${ROOT}" "${rootmnt}"; then
-                zram_log "WARNING: Second mount attempt failed, trying fallback 2..."
-                
-                if ! mount ${roflag} -t "${FSTYPE}" "${ROOT}" "${rootmnt}"; then
-                    zram_log "ERROR: All mount attempts failed"
-                    panic "Failed to mount ZRAM root ${ROOT}!"
-                else
-                    zram_log "Third mount attempt succeeded"
-                fi
-            else
-                zram_log "Second mount attempt succeeded"
-            fi
-        else
+        ZRAM_MOUNT_SUCCESS=false
+        if mount ${roflag} -t "${FSTYPE}" -o "${ROOTFLAGS}" "${ROOT}" "${rootmnt}"; then
             zram_log "First mount attempt succeeded"
+            ZRAM_MOUNT_SUCCESS=true
+        else
+            zram_log "WARNING: First mount attempt failed, trying fallback 1..."
+
+            if mount ${roflag} -t "${FSTYPE}" -o "rw,noatime" "${ROOT}" "${rootmnt}"; then
+                zram_log "Second mount attempt succeeded"
+                ZRAM_MOUNT_SUCCESS=true
+            else
+                zram_log "WARNING: Second mount attempt failed, trying fallback 2..."
+
+                if mount ${roflag} -t "${FSTYPE}" "${ROOT}" "${rootmnt}"; then
+                    zram_log "Third mount attempt succeeded"
+                    ZRAM_MOUNT_SUCCESS=true
+                else
+                    zram_log "ERROR: All ZRAM mount attempts failed"
+                fi
+            fi
         fi
-        
+
         # Verify mount worked
-        if ! mountpoint -q "${rootmnt}"; then
-            zram_log "ERROR: Mount verification failed, ${rootmnt} is not a mountpoint"
-            panic "ZRAM root mount verification failed!"
+        if [ "$ZRAM_MOUNT_SUCCESS" = "true" ] && mountpoint -q "${rootmnt}"; then
+            zram_log "ZRAM root mount verified successfully"
+        else
+            zram_log "ERROR: ZRAM mount failed or verification failed"
+            zram_log "Attempting fallback to normal root boot..."
+
+            # Clean up any partial mount
+            umount "${rootmnt}" 2>/dev/null || true
+
+            # Get the original root device from kernel command line
+            ORIG_ROOT=$(cat /proc/cmdline | grep -oE 'root=[^[:space:]]+' | cut -d'=' -f2-)
+            if [ -n "$ORIG_ROOT" ]; then
+                zram_log "Falling back to original root: $ORIG_ROOT"
+
+                # Resolve UUID/LABEL if needed
+                if echo "$ORIG_ROOT" | grep -q "^UUID=\|^LABEL="; then
+                    if command -v blkid >/dev/null 2>&1; then
+                        ORIG_ROOT=$(blkid -l -t "$ORIG_ROOT" -o device 2>/dev/null)
+                    fi
+                fi
+
+                if [ -b "$ORIG_ROOT" ]; then
+                    # Try to mount the original root
+                    if mount -o ro "$ORIG_ROOT" "${rootmnt}"; then
+                        zram_log "Successfully fell back to normal root boot"
+                        log_end_msg 0
+                        return 0
+                    fi
+                fi
+            fi
+
+            # If fallback also fails, then panic
+            panic "ZRAM root mount failed and fallback to normal root also failed!"
         fi
         
         # Mount was successful!
@@ -416,9 +529,11 @@ local_mount_root()
         if ! safe_sync 3 "ZRAM root filesystem"; then
             zram_log "WARNING: ZRAM sync timed out, but continuing anyway"
         fi
-        
+
         zram_log "ZRAM root mount process completed successfully"
         log_end_msg 0
+
+        fi  # End of "if ZRAMROOT_DEVICE exists" block
 
     else
         # Standard root mounting logic (as in original script)
